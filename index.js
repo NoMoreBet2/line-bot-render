@@ -3,231 +3,212 @@
 const express = require('express');
 const line = require('@line/bot-sdk');
 const crypto = require('crypto');
+const admin = require('firebase-admin');
+
+// Firebase Admin SDKを初期化
+admin.initializeApp({
+  credential: admin.credential.applicationDefault()
+});
+const db = admin.firestore();
 
 const app = express();
 
-/**
- * ==== LINE 設定（Render 環境変数名に合わせ済み）====
- * CHANNEL_ACCESS_TOKEN / CHANNEL_SECRET を Render の Environment に設定しておく
- */
+// LINE SDKを初期化
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET,
 };
 const client = new line.Client(config);
 
-/**
- * ==== メモリストア（最小構成）====
- * 本番は Firestore 等に置き換え推奨
- */
-const pairCodes = new Map();       // code -> { code, expiresAt, userId|null, status:'waiting'|'paired' }
-const unlockRequests = new Map();  // code -> { status:'pending'|'approved'|'rejected'|'expired', token|null, tokenExpiresAt|null }
-
+// ヘルパー関数
 const now = () => Date.now();
 const minutes = (n) => n * 60 * 1000;
-const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // 紛らわしい文字除外
+const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 function genCode(len = 6) {
   return Array.from({ length: len }, () => ALPHABET[Math.floor(Math.random() * ALPHABET.length)]).join('');
 }
 function genOneTimeToken() {
-  return crypto.randomBytes(24).toString('hex'); // 48文字
+  return crypto.randomBytes(24).toString('hex');
 }
 
-/**
- * ==== ルート & ヘルスチェック ====
- */
+// ルート
 app.get('/', (_, res) => res.send('LINE Bot is running!'));
 
-/**
- * ==== Webhook（手動署名検証・Verify 対応）====
- * - ここは raw ボディ必須。グローバルの express.json() は絶対に使わない。
- * - LINE Developers の「接続確認（Verify）」は署名・ボディが無い事があるので 200 を返して通す。
- */
+// Webhook
 app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
-  try {
-    const signature = req.get('x-line-signature');
-    const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
-    const bodyString = buf.toString('utf8');
-
-    // Verify/空ボディは 200 で返す（設定確認用）
-    if (!signature || bodyString.length === 0) {
-      console.log('[webhook] verify or empty body -> 200');
-      return res.sendStatus(200);
-    }
-
-    // 署名検証
-    const ok = line.validateSignature(bodyString, config.channelSecret, signature);
-    if (!ok) {
-      console.warn('[webhook] invalid signature');
-      return res.sendStatus(401);
-    }
-
-    // JSON パース
-    let json;
     try {
-      json = JSON.parse(bodyString);
+        const signature = req.get('x-line-signature');
+        const bodyString = req.body.toString('utf8');
+        if (!signature || bodyString.length === 0) return res.sendStatus(200);
+        if (!line.validateSignature(bodyString, config.channelSecret, signature)) return res.sendStatus(401);
+        const json = JSON.parse(bodyString);
+        await Promise.all(json.events.map(handleEvent));
+        return res.sendStatus(200);
     } catch (e) {
-      console.warn('[webhook] JSON parse failed -> 200');
-      return res.sendStatus(200);
+        console.error('webhook error', e);
+        return res.sendStatus(200);
     }
-
-    const events = Array.isArray(json.events) ? json.events : [];
-    await Promise.all(events.map(handleEvent));
-
-    return res.sendStatus(200);
-  } catch (e) {
-    console.error('webhook error', e);
-    // 本番運用では 500 でもOKだが、Verify を通すため 200 にしておく
-    return res.sendStatus(200);
-  }
 });
 
-/**
- * ==== イベント処理 ====
- */
+// イベント処理
 async function handleEvent(event) {
-  // テキストメッセージ
-  if (event.type === 'message' && event.message?.type === 'text') {
-    const text = (event.message.text || '').trim();
-
-    // pair CODE
-    const m = /^pair\s+([A-Z0-9]{4,10})$/i.exec(text);
-    if (m && event.source?.userId) {
-      const code = m[1].toUpperCase();
-      const rec = pairCodes.get(code);
-      if (!rec) return reply(event.replyToken, `コード ${code} は見つかりません。アプリから新しいコードを発行してください。`);
-      if (rec.expiresAt < now()) return reply(event.replyToken, `コード ${code} の有効期限が切れています。再発行してください。`);
-      rec.userId = event.source.userId;
-      rec.status = 'paired';
-      pairCodes.set(code, rec);
-      return reply(event.replyToken, `ペアリング完了しました ✅（コード：${code}）`);
+    // テキストメッセージ
+    if (event.type === 'message' && event.message?.type === 'text') {
+        const text = (event.message.text || '').trim();
+        const m = /^pair\s+([A-Z0-9]{4,10})$/i.exec(text);
+        if (m && event.source?.userId) {
+            const code = m[1].toUpperCase();
+            try {
+                const docRef = db.collection('pairing_status').doc(code);
+                const doc = await docRef.get();
+                if (!doc.exists) return reply(event.replyToken, `コード ${code} は見つかりません。`);
+                if (doc.data().expiresAt < now()) return reply(event.replyToken, `コード ${code} の有効期限が切れています。`);
+                await docRef.update({ userId: event.source.userId, status: 'paired' });
+                return reply(event.replyToken, `ペアリング完了しました ✅（コード：${code}）`);
+            } catch (error) {
+                console.error("Firestore update failed:", error);
+                return reply(event.replyToken, "エラーが発生しました。");
+            }
+        }
     }
 
-    if (/^help$/i.test(text)) {
-      return reply(
-        event.replyToken,
-        '使い方：\n1) アプリでコード発行\n2) ここに「pair CODE」を送信\n3) 解除申請が来たら承認/拒否ボタンで応答'
-      );
+    // 承認/拒否 postback
+    if (event.type === 'postback') {
+        const data = event.postback?.data || '';
+        const ap = /^approve:([A-Z0-9]{4,10})$/i.exec(data);
+        const rj = /^reject:([A-Z0-9]{4,10})$/i.exec(data);
+
+        if (ap) {
+            const code = ap[1].toUpperCase();
+            try {
+                const token = genOneTimeToken();
+                await db.collection('unlock_requests').doc(code).update({
+                    status: 'approved',
+                    token: token,
+                    tokenExpiresAt: now() + minutes(10)
+                });
+                if (event.source?.userId) {
+                    await client.pushMessage(event.source.userId, { type: 'text', text: '承認しました。解除は10分以内に実行されます。' });
+                }
+            } catch (error) { console.error("Approval failed:", error); }
+            return;
+        }
+
+        if (rj) {
+            const code = rj[1].toUpperCase();
+            try {
+                await db.collection('unlock_requests').doc(code).update({
+                    status: 'rejected',
+                    token: null,
+                    tokenExpiresAt: null
+                });
+                if (event.source?.userId) {
+                    await client.pushMessage(event.source.userId, { type: 'text', text: '解除申請を拒否しました。' });
+                }
+            } catch (error) { console.error("Rejection failed:", error); }
+            return;
+        }
     }
-
-    // 既定はエコー
-    return client.replyMessage(event.replyToken, { type: 'text', text });
-  }
-
-  // 承認/拒否 postback
-  if (event.type === 'postback') {
-    const data = event.postback?.data || '';
-    const ap = /^approve:([A-Z0-9]{4,10})$/i.exec(data);
-    const rj = /^reject:([A-Z0-9]{4,10})$/i.exec(data);
-
-    if (ap) {
-      const code = ap[1].toUpperCase();
-      const reqRec = unlockRequests.get(code);
-      if (!reqRec) return;
-      reqRec.status = 'approved';
-      if (!reqRec.token) {
-        reqRec.token = genOneTimeToken();
-        reqRec.tokenExpiresAt = now() + minutes(10); // 5〜10分で調整可
-      }
-      unlockRequests.set(code, reqRec);
-      if (event.source?.userId) {
-        await client.pushMessage(event.source.userId, { type: 'text', text: '承認しました。解除は10分以内に実行されます。' });
-      }
-      return;
-    }
-
-    if (rj) {
-      const code = rj[1].toUpperCase();
-      const reqRec = unlockRequests.get(code);
-      if (!reqRec) return;
-      reqRec.status = 'rejected';
-      reqRec.token = null;
-      reqRec.tokenExpiresAt = null;
-      unlockRequests.set(code, reqRec);
-      if (event.source?.userId) {
-        await client.pushMessage(event.source.userId, { type: 'text', text: '解除申請を拒否しました。' });
-      }
-      return;
-    }
-  }
 }
 
 function reply(replyToken, text) {
-  return client.replyMessage(replyToken, { type: 'text', text });
+    return client.replyMessage(replyToken, { type: 'text', text });
 }
 
-/**
- * ==== 追加API（JSONが必要なものだけ個別にパーサ）====
- */
+// ===== 追加API =====
 
-// A) ペアコード発行（GET/POSTどちらでも）
-function issuePair(req, res) {
-  const code = genCode(6);
-  const expiresAt = now() + minutes(30); // 30分有効
-  pairCodes.set(code, { code, expiresAt, userId: null, status: 'waiting' });
-  res.json({ code, expiresAt });
+// A) ペアコード発行
+async function issuePair(req, res) {
+    const code = genCode(6);
+    const expiresAt = now() + minutes(30);
+    try {
+        await db.collection('pairing_status').doc(code).set({
+            code: code,
+            expiresAt: expiresAt,
+            userId: null,
+            status: 'waiting'
+        });
+        res.json({ code, expiresAt });
+    } catch (error) {
+        console.error("Failed to create pair code:", error);
+        res.status(500).json({ error: "Failed to issue a pair code." });
+    }
 }
 app.get('/pair/create', issuePair);
 app.post('/pair/create', issuePair);
 
-// B) 解除リクエスト → 承認/拒否テンプレをPush
+// B) 解除リクエスト
 app.post('/unlock/request', express.json(), async (req, res) => {
-  const code = (req.body?.code || '').toString().toUpperCase();
-  if (!code) return res.status(400).json({ error: 'code is required' });
+    const code = (req.body?.code || '').toString().toUpperCase();
+    if (!code) return res.status(400).json({ error: 'code is required' });
 
-  const rec = pairCodes.get(code);
-  if (!rec) return res.status(404).json({ error: 'pair code not found' });
-  if (rec.expiresAt < now()) return res.status(400).json({ error: 'pair code expired' });
-  if (!rec.userId) return res.status(400).json({ error: 'not paired yet' });
+    try {
+        const pairDoc = await db.collection('pairing_status').doc(code).get();
+        if (!pairDoc.exists) return res.status(404).json({ error: 'pair code not found' });
+        
+        const pairData = pairDoc.data();
+        if (pairData.expiresAt < now()) return res.status(400).json({ error: 'pair code expired' });
+        if (pairData.status !== 'paired' || !pairData.userId) return res.status(400).json({ error: 'not paired yet' });
 
-  unlockRequests.set(code, { status: 'pending', token: null, tokenExpiresAt: null });
+        // Firestoreに解除申請ドキュメントを作成
+        await db.collection('unlock_requests').doc(code).set({
+            status: 'pending',
+            token: null,
+            tokenExpiresAt: null,
+            requestedAt: now()
+        });
 
-  await client.pushMessage(rec.userId, {
-    type: 'template',
-    altText: '解除申請が届きました',
-    template: {
-      type: 'confirm',
-      text: '解除申請が届きました。承認しますか？（15分限定解除）',
-      actions: [
-        { type: 'postback', label: '承認', data: `approve:${code}` },
-        { type: 'postback', label: '拒否', data: `reject:${code}` },
-      ],
-    },
-  });
-
-  res.json({ ok: true });
+        await client.pushMessage(pairData.userId, {
+            type: 'template',
+            altText: '解除申請が届きました',
+            template: {
+                type: 'confirm',
+                text: '解除申請が届きました。承認しますか？（15分限定解除）',
+                actions: [
+                    { type: 'postback', label: '承認', data: `approve:${code}` },
+                    { type: 'postback', label: '拒否', data: `reject:${code}` },
+                ],
+            },
+        });
+        res.json({ ok: true });
+    } catch (error) {
+        console.error("Unlock request failed:", error);
+        res.status(500).json({ error: "Failed to process unlock request." });
+    }
 });
 
-// C) ポーリング：承認済みならワンタイムトークンを1回だけ返す
-app.get('/unlock/poll', (req, res) => {
-  const code = (req.query.code || '').toString().toUpperCase();
-  if (!code) return res.status(400).json({ error: 'code is required' });
+// C) ポーリング
+app.get('/unlock/poll', async (req, res) => {
+    const code = (req.query.code || '').toString().toUpperCase();
+    if (!code) return res.status(400).json({ error: 'code is required' });
+    
+    try {
+        const doc = await db.collection('unlock_requests').doc(code).get();
+        if (!doc.exists) return res.json({ status: 'none' });
 
-  const reqRec = unlockRequests.get(code);
-  if (!reqRec) return res.json({ status: 'none' });
-  if (reqRec.status === 'rejected') return res.json({ status: 'rejected' });
-  if (reqRec.status === 'pending') return res.json({ status: 'pending' });
+        const reqRec = doc.data();
+        if (reqRec.status === 'rejected') return res.json({ status: 'rejected' });
+        if (reqRec.status === 'pending') return res.json({ status: 'pending' });
+        
+        if (reqRec.status === 'approved') {
+            if (reqRec.tokenExpiresAt < now()) {
+                await doc.ref.update({ status: 'expired' });
+                return res.json({ status: 'expired' });
+            }
+            const token = reqRec.token;
+            // トークンを一度返したら無効化する
+            await doc.ref.update({ token: null });
+            return res.json({ status: 'approved', token, tokenExpiresAt: reqRec.tokenExpiresAt });
+        }
 
-  // approved
-  if (!reqRec.token) {
-    reqRec.token = genOneTimeToken();
-    reqRec.tokenExpiresAt = now() + minutes(10);
-  }
-  if (reqRec.tokenExpiresAt < now()) {
-    reqRec.status = 'expired';
-    unlockRequests.set(code, reqRec);
-    return res.json({ status: 'expired' });
-  }
-
-  const token = reqRec.token;
-  reqRec.token = null; // 1回限り
-  unlockRequests.set(code, reqRec);
-  res.json({ status: 'approved', token, tokenExpiresAt: reqRec.tokenExpiresAt });
+        return res.json({ status: reqRec.status });
+    } catch (error) {
+        console.error("Polling failed:", error);
+        res.status(500).json({ error: "Polling failed." });
+    }
 });
 
-/**
- * ==== 起動 ====
- */
+// ==== 起動 ====
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`listening on ${port}`);
