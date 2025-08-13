@@ -2,7 +2,7 @@
 
 const express = require('express');
 const line = require('@line/bot-sdk');
-const crypto = require('crypto');
+const crypto =require('crypto');
 const admin = require('firebase-admin');
 
 const app = express();
@@ -100,80 +100,60 @@ async function handleEvent(event) {
 
       try {
         const dbx = getDb();
+        
+        // ★ 修正点 1: 検索方法の変更
+        // 'users'コレクションで、'pairingStatus.code'フィールドが一致するものを探す
+        const usersQuery = await dbx.collection('users')
+          .where('pairingStatus.code', '==', code)
+          .limit(1)
+          .get();
 
-        // 1) 逆引き：/codes/{code} を一発参照
-        const codeRef = dbx.collection('codes').doc(code);
-        const codeSnap = await codeRef.get();
-
-        let appUserUid = null;
-        let codeMeta = null;
-
-        if (codeSnap.exists) {
-          codeMeta = codeSnap.data() || {};
-          appUserUid = codeMeta.appUserUid || null;
-          const exp = codeMeta.expiresAt || 0;
-          const st = codeMeta.status || 'waiting';
-
-          if (!appUserUid) {
-            // フォールバック：古い発行フローで appUserUid 未保存の場合は検索で補完
-            const cg = await dbx.collectionGroup('pairing_status')
-              .where('code', '==', code).limit(1).get();
-            if (!cg.empty) {
-              const path = cg.docs[0].ref.path; // users/{uid}/pairing_status/{code}
-              appUserUid = path.split('/')[1];
-            }
-          }
-
-          if (!appUserUid) return reply(event.replyToken, `コード ${code} は無効です。`);
-          if (exp && exp < now()) return reply(event.replyToken, `コード ${code} の有効期限が切れています。`);
-          if (st === 'paired') return reply(event.replyToken, `このコードは既に使用済みです。`);
-        } else {
-          // 逆引きが無い場合のフォールバック：collectionGroup 検索
-          const cg = await dbx.collectionGroup('pairing_status')
-            .where('code', '==', code).limit(1).get();
-          if (cg.empty) return reply(event.replyToken, `コード ${code} は見つかりません。`);
-          const path = cg.docs[0].ref.path;
-          appUserUid = path.split('/')[1];
-          codeMeta = { expiresAt: now() + minutes(5), status: 'waiting' }; // 仮
+        if (usersQuery.empty) {
+          return reply(event.replyToken, `コード ${code} は見つかりません。`);
         }
 
-        // 2) 本体(users/{uid}/pairing_status/{code})を paired に、/codes/{code} も同期
-        const userRef = dbx.collection('users').doc(appUserUid)
-          .collection('pairing_status').doc(code);
+        const userDoc = usersQuery.docs[0];
+        const appUserUid = userDoc.id;
+        const pairingStatus = userDoc.data().pairingStatus || {};
 
-        const batch = dbx.batch();
-        batch.set(userRef, {
-          code,
-          expiresAt: codeMeta.expiresAt || (now() + minutes(30)),
+        // 有効期限や使用状況をチェック
+        const exp = pairingStatus.expiresAt || 0;
+        const st = pairingStatus.status || 'waiting';
+
+        if (exp && exp < now()) return reply(event.replyToken, `コード ${code} の有効期限が切れています。`);
+        if (st === 'paired') return reply(event.replyToken, `このコードは既に使用済みです。`);
+
+        // ★ 修正点 2: 更新方法の変更
+        // userドキュメントの'pairingStatus'フィールドを丸ごと更新する
+        const newPairingStatus = {
+          ...pairingStatus, // 既存のデータを保持 (code, createdAt, expiresAtなど)
           status: 'paired',
           pairedAt: admin.firestore.FieldValue.serverTimestamp(),
-          partnerLineUserId: partnerLineUserId
+          partnerLineUserId: partnerLineUserId,
+          partnerDisplayName: (await client.getProfile(partnerLineUserId)).displayName,
+        };
+        
+        const userRef = dbx.collection('users').doc(appUserUid);
+        await userRef.update({ pairingStatus: newPairingStatus });
+
+        // (任意) 逆引き用の /codes/{code} も更新
+        await dbx.collection('codes').doc(code).set({
+            appUserUid: appUserUid,
+            status: 'paired',
+            lineUserId: partnerLineUserId
         }, { merge: true });
 
-        // 逆引きdocが無い/古い場合も作成・更新して同期
-        const codePayload = {
-          appUserUid: appUserUid,
-          status: 'paired',
-          pairedAt: admin.firestore.FieldValue.serverTimestamp(),
-          lineUserId: partnerLineUserId
-        };
-        if (codeMeta.expiresAt) codePayload.expiresAt = codeMeta.expiresAt;
-        batch.set(codeRef, codePayload, { merge: true });
-
-        await batch.commit();
         return reply(event.replyToken, `ペアリング完了しました ✅（コード：${code}）`);
+
       } catch (error) {
         console.error('pair webhook error', error);
         return reply(event.replyToken, 'エラーが発生しました。');
       }
     }
 
-    // ヘルプ
     if (/^help$/i.test(text)) {
       return reply(event.replyToken, '使い方：\n1) アプリでコード発行\n2) ここに「pair CODE」を送信\n3) 解除申請が来たら承認/拒否で応答');
     }
-
-    // エコー
     return reply(event.replyToken, text);
   }
 
@@ -219,8 +199,7 @@ function reply(replyToken, text) {
   return client.replyMessage(replyToken, { type: 'text', text });
 }
 
-// ---- コード発行API（推奨：POSTでuidを受け取る）----
-// クライアント: bodyに { appUserUid } を入れて呼ぶ
+// ---- コード発行API（POST）----
 app.post('/pair/create', express.json(), async (req, res) => {
   const appUserUid = (req.body?.appUserUid || '').toString().trim();
   if (!appUserUid) return res.status(400).json({ error: 'appUserUid is required' });
@@ -230,39 +209,28 @@ app.post('/pair/create', express.json(), async (req, res) => {
 
   try {
     const dbx = getDb();
+    const batch = dbx.batch();
 
-    // 逆引き：/codes/{code}
-    await dbx.collection('codes').doc(code).set({
+    // 1. 逆引き用の /codes/{code} を作成
+    const codeRef = dbx.collection('codes').doc(code);
+    batch.set(codeRef, {
       appUserUid,
       expiresAt,
       status: 'waiting',
       createdAt: admin.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
+    });
 
-    // （任意）サーバーでもユーザー配下を作っておきたい場合は以下を有効化
-    // await dbx.collection('users').doc(appUserUid)
-    //   .collection('pairing_status').doc(code)
-    //   .set({ code, expiresAt, status: 'waiting', createdAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-
-    res.json({ code, expiresAt });
-  } catch (e) {
-    console.error('Failed to create pair code:', e);
-    res.status(500).json({ error: 'Failed to issue a pair code.' });
-  }
-});
-
-// ---- 旧フロー互換: GETでも発行（uidが無いので逆引きは最小）----
-app.get('/pair/create', async (_, res) => {
-  const code = genCode(6).toUpperCase();
-  const expiresAt = now() + minutes(30);
-  try {
-    const dbx = getDb();
-    // appUserUid が無いのでまずは逆引きの器だけ用意（pair時に補完フォールバックあり）
-    await dbx.collection('codes').doc(code).set({
+    // ★ 修正点 3: ユーザーの pairingStatus フィールドを更新
+    const userRef = dbx.collection('users').doc(appUserUid);
+    const pairingData = {
+      code,
       expiresAt,
       status: 'waiting',
       createdAt: admin.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
+    };
+    batch.update(userRef, { pairingStatus: pairingData });
+
+    await batch.commit();
 
     res.json({ code, expiresAt });
   } catch (e) {
@@ -278,43 +246,49 @@ app.post('/unlock/request', express.json(), async (req, res) => {
 
   try {
     const dbx = getDb();
-
+    
     // まず逆引きを参照
     const codeSnap = await dbx.collection('codes').doc(code).get();
     if (!codeSnap.exists) return res.status(404).json({ error: 'pair code not found' });
-
+    
     const cdata = codeSnap.data() || {};
     if ((cdata.expiresAt || 0) < now()) return res.status(400).json({ error: 'pair code expired' });
     if (cdata.status !== 'paired') return res.status(400).json({ error: 'not paired yet' });
-
-    // パートナーLINE ID（承認依頼の送信先）
+    
     let partnerLineUserId = cdata.lineUserId || null;
 
-    // 無ければユーザー配下から補完
+    // ★ 修正点 4: パートナーIDのフォールバック処理を修正
     if (!partnerLineUserId && cdata.appUserUid) {
-      const uref = dbx.collection('users').doc(cdata.appUserUid).collection('pairing_status').doc(code);
-      const usnap = await uref.get();
-      if (usnap.exists) partnerLineUserId = (usnap.data() || {}).partnerLineUserId || null;
+      const userRef = dbx.collection('users').doc(cdata.appUserUid);
+      const userSnap = await userRef.get();
+      if (userSnap.exists) {
+        const pairingStatus = userSnap.data().pairingStatus || {};
+        if (pairingStatus.code === code) { // 念のためコードが一致することを確認
+          partnerLineUserId = pairingStatus.partnerLineUserId || null;
+        }
+      }
+    }
+
+    if (!partnerLineUserId) {
+        return res.status(404).json({ error: 'Partner not found for this code.' });
     }
 
     await dbx.collection('unlock_requests').doc(code).set({
       status: 'pending', token: null, tokenExpiresAt: null, requestedAt: now()
     });
 
-    if (partnerLineUserId) {
-      await client.pushMessage(partnerLineUserId, {
-        type: 'template',
-        altText: '解除申請が届きました',
-        template: {
-          type: 'confirm',
-          text: '解除申請が届きました。承認しますか？（15分限定解除）',
-          actions: [
-            { type: 'postback', label: '承認', data: `approve:${code}` },
-            { type: 'postback', label: '拒否', data: `reject:${code}` },
-          ],
-        },
-      });
-    }
+    await client.pushMessage(partnerLineUserId, {
+      type: 'template',
+      altText: '解除申請が届きました',
+      template: {
+        type: 'confirm',
+        text: '解除申請が届きました。承認しますか？（15分限定解除）',
+        actions: [
+          { type: 'postback', label: '承認', data: `approve:${code}` },
+          { type: 'postback', label: '拒否', data: `reject:${code}` },
+        ],
+      },
+    });
 
     res.json({ ok: true });
   } catch (e) {
