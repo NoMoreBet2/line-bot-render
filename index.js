@@ -2,56 +2,28 @@
 
 const express = require('express');
 const line = require('@line/bot-sdk');
-const crypto = require('crypto');
 const admin = require('firebase-admin');
 
-// ★ 認証情報を検証するためのミドルウェアを追加
-const firebaseAuthMiddleware = async (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized: No token provided' });
-  }
-  const idToken = authHeader.split('Bearer ')[1];
-  try {
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
-    req.auth = { uid: decodedToken.uid }; // 後続の処理で使えるように、デコードした情報をreqオブジェクトに追加
-    next();
-  } catch (error) {
-    console.error('Error verifying token:', error);
-    return res.status(403).json({ error: 'Unauthorized: Invalid token' });
-  }
-};
+// ==============================
+// 環境変数
+// ==============================
+// ※ Render などの環境に必ず設定
+// CHANNEL_ACCESS_TOKEN : LINE 長期チャネルアクセストークン
+// CHANNEL_SECRET       : LINE チャネルシークレット
+// FIREBASE_SERVICE_ACCOUNT_JSON : サービスアカウントJSON（文字列; 未設定ならADCで初期化）
+const PORT = process.env.PORT || 3000;
 
-
-const app = express();
-app.use(express.json()); // JSONボディをパースするために必要
-
-// ---- health (Renderの監視用)
-app.get('/', (_, res) => res.send('LINE Bot is running!'));
-app.get('/healthz', (_, res) => res.send('healthy'));
-
-// ---- 起動を最優先
-const port = process.env.PORT || 3000;
-app.listen(port, '0.0.0.0', () => {
-  console.log(`listening on ${port}`);
-  initAsync().catch(e => console.error('initAsync fatal:', e));
-});
-
-// ---- グローバル変数 ----
+// ==============================
+// Firebase Admin 初期化
+// ==============================
 let db = null;
-const getDb = () => {
-  if (!db) throw new Error('Firestore not initialized yet');
-  return db;
-};
-
-// ---- 非同期初期化 ----
 async function initAsync() {
-  // Firebase Admin SDKの初期化
   const sa = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   try {
     if (sa) {
       admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
     } else {
+      // 環境のADCを使う（Render等では未設定なら失敗するのでログ確認）
       admin.initializeApp();
     }
     db = admin.firestore();
@@ -60,43 +32,89 @@ async function initAsync() {
     console.error('Firebase init failed:', e);
   }
 }
+const getDb = () => {
+  if (!db) throw new Error('Firestore not initialized yet');
+  return db;
+};
 
-// ---- LINE設定 ----
-const config = {
+// ==============================
+// LINE 設定
+// ==============================
+const lineConfig = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET,
 };
-const client = new line.Client(config);
+const client = new line.Client(lineConfig);
 
-// ---- ユーティリティ ----
+// ==============================
+// Express 準備
+// ==============================
+const app = express();
+
+// ---- health (監視用)
+app.get('/', (_, res) => res.send('LINE Bot is running!'));
+app.get('/healthz', (_, res) => res.send('healthy'));
+
+// ==============================
+// Webhook（最優先で定義！）
+// - @line/bot-sdk の middleware が署名検証と raw ボディ処理を担当
+// - 他の body parser（express.json 等）より前に置く
+// ==============================
+app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
+  // 先に 200 を返す（LINE には成功扱いにする）
+  res.sendStatus(200);
+
+  try {
+    const events = req.body?.events || [];
+    await Promise.all(events.map(handleEvent));
+  } catch (e) {
+    console.error('webhook error', e);
+  }
+});
+
+// ==============================
+// ここから下は通常の JSON API 用
+// webhook より後に body parser を入れる
+// ==============================
+app.use(express.json());
+
+// ==============================
+// Firebase 認証ミドルウェア（アプリの自前API向け）
+// ==============================
+const firebaseAuthMiddleware = async (req, res, next) => {
+  const authHeader = req.headers.authorization || '';
+  if (!authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized: No token provided' });
+  }
+  const idToken = authHeader.substring('Bearer '.length);
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    req.auth = { uid: decoded.uid };
+    next();
+  } catch (error) {
+    console.error('Error verifying token:', error);
+    return res.status(403).json({ error: 'Unauthorized: Invalid token' });
+  }
+};
+
+// ==============================
+// ユーティリティ
+// ==============================
 const now = () => Date.now();
 const minutes = (n) => n * 60 * 1000;
 const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 function genCode(len = 6) {
   return Array.from({ length: len }, () => ALPHABET[Math.floor(Math.random() * ALPHABET.length)]).join('');
 }
+function reply(replyToken, text) {
+  return client.replyMessage(replyToken, { type: 'text', text });
+}
 
-
-// ---- webhook（LINEからの通知を受け取る場所）----
-app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
-  try {
-    const signature = req.get('x-line-signature');
-    const bodyString = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : req.body.toString();
-    if (!signature || !line.validateSignature(bodyString, config.channelSecret, signature)) {
-      return res.sendStatus(401);
-    }
-    const json = JSON.parse(bodyString);
-    await Promise.all((json.events || []).map(handleEvent));
-    res.sendStatus(200);
-  } catch (e) {
-    console.error('webhook error', e);
-    res.sendStatus(200); // LINEサーバーには常に成功を返す
-  }
-});
-
-// ---- メインイベントハンドラ ----
+// ==============================
+// メインイベントハンドラ
+// ==============================
 async function handleEvent(event) {
-  // ===== 1. パートナーがペアコードを送信した時の処理 =====
+  // 1) テキストメッセージ（ペアコード受信）
   if (event.type === 'message' && event.message?.type === 'text') {
     const text = (event.message.text || '').trim();
     const m = /^pair\s+([A-Z0-9]{4,10})$/i.exec(text);
@@ -107,7 +125,7 @@ async function handleEvent(event) {
         const dbx = getDb();
         const usersQuery = await dbx.collection('users').where('pairingStatus.code', '==', code).limit(1).get();
         if (usersQuery.empty) return reply(event.replyToken, `コード ${code} は見つかりません。`);
-        
+
         const userDoc = usersQuery.docs[0];
         const appUserUid = userDoc.id;
         const pairingStatus = userDoc.data().pairingStatus || {};
@@ -120,13 +138,13 @@ async function handleEvent(event) {
           ...pairingStatus,
           status: 'paired',
           pairedAt: admin.firestore.FieldValue.serverTimestamp(),
-          partnerLineUserId: partnerLineUserId,
+          partnerLineUserId,
           partnerDisplayName: partnerProfile.displayName,
         };
-        
+
         const userRef = dbx.collection('users').doc(appUserUid);
         await userRef.update({ pairingStatus: newPairingStatus });
-        await dbx.collection('codes').doc(code).delete(); // ★ 完了したので逆引きコードを削除
+        await dbx.collection('codes').doc(code).delete(); // 逆引きコードを削除
 
         return reply(event.replyToken, `ペアリング完了しました ✅`);
       } catch (error) {
@@ -136,7 +154,7 @@ async function handleEvent(event) {
     }
   }
 
-  // ===== 2. パートナーが解除申請を承認/拒否した時の処理 =====
+  // 2) ポストバック（承認/拒否）
   if (event.type === 'postback') {
     const data = event.postback?.data || '';
     const ap = /^approve:(.+)$/i.exec(data); // approve:{uid}
@@ -145,37 +163,37 @@ async function handleEvent(event) {
     if (ap) {
       const appUserUid = ap[1];
       try {
-        // ★ FirestoreのblockStatusを直接更新
         const userRef = getDb().collection('users').doc(appUserUid);
         await userRef.update({
           'blockStatus.isActive': false,
-          'blockStatus.activatedAt': null
+          'blockStatus.activatedAt': null,
         });
         if (event.source?.userId) {
           await client.pushMessage(event.source.userId, { type: 'text', text: '承認しました。' });
         }
-      } catch (err) { console.error('Approval failed:', err); }
+      } catch (err) {
+        console.error('Approval failed:', err);
+      }
       return;
     }
 
     if (rj) {
-      // 拒否された場合は何もしないが、パートナーには応答する
       if (event.source?.userId) {
         await client.pushMessage(event.source.userId, { type: 'text', text: '解除申請を拒否しました。' });
       }
       return;
     }
   }
+
+  // その他イベントは無視
+  return;
 }
 
-// ---- 返信ユーティリティ ----
-function reply(replyToken, text) {
-  return client.replyMessage(replyToken, { type: 'text', text });
-}
+// ==============================
+// 自前 API
+// ==============================
 
-// ---- APIエンドポイント ----
-
-// 1. ペアコード発行API
+// 1) ペアコード発行
 app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
   const appUserUid = req.auth.uid;
   const code = genCode(6).toUpperCase();
@@ -183,15 +201,19 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
   try {
     const dbx = getDb();
     const batch = dbx.batch();
-    
-    // 逆引き用のcodesコレクションに一時的に保存
+
+    // 逆引き用 codes コレクション
     const codeRef = dbx.collection('codes').doc(code);
     batch.set(codeRef, { appUserUid, expiresAt });
 
-    // ユーザーのpairingStatusフィールドを更新
+    // ユーザーの pairingStatus 更新
     const userRef = dbx.collection('users').doc(appUserUid);
-    batch.update(userRef, { 'pairingStatus.code': code, 'pairingStatus.expiresAt': expiresAt, 'pairingStatus.status': 'waiting' });
-    
+    batch.update(userRef, {
+      'pairingStatus.code': code,
+      'pairingStatus.expiresAt': expiresAt,
+      'pairingStatus.status': 'waiting',
+    });
+
     await batch.commit();
     res.json({ code, expiresAt });
   } catch (e) {
@@ -200,7 +222,7 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
   }
 });
 
-// 2. パートナーへの解除申請API (新バージョン)
+// 2) パートナーへの解除申請（Confirm テンプレ送信）
 app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   try {
@@ -215,7 +237,6 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
       return res.status(400).json({ error: 'Partner is not configured.' });
     }
 
-    // ★ LINEのボタンに、アプリ利用者のuidを含める
     await client.pushMessage(partnerLineUserId, {
       type: 'template',
       altText: '解除申請が届きました',
@@ -233,4 +254,12 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
     console.error('Unlock request failed:', e);
     res.status(500).json({ error: 'Failed to process unlock request.' });
   }
+});
+
+// ==============================
+// サーバー起動
+// ==============================
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`listening on ${PORT}`);
+  initAsync().catch((e) => console.error('initAsync fatal:', e));
 });
