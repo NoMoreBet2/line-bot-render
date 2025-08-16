@@ -6,7 +6,7 @@ const admin = require('firebase-admin');
 const crypto = require('crypto');
 
 // ==============================
-// 環境変数
+// Environment Variables
 // ==============================
 const PORT = process.env.PORT || 3000;
 const lineConfig = {
@@ -15,19 +15,22 @@ const lineConfig = {
 };
 
 // ==============================
-// Firebase Admin 初期化
+// Firebase Admin Initialization
 // ==============================
 let db = null;
-try {
+async function initAsync() {
   const sa = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (sa) {
-    admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
-  } else {
-    admin.initializeApp();
+  try {
+    if (sa) {
+      admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
+    } else {
+      admin.initializeApp();
+    }
+    db = admin.firestore();
+    console.log('Firestore handle obtained');
+  } catch (e) {
+    console.error('Firebase init failed:', e);
   }
-  db = admin.firestore();
-} catch (e) {
-  console.error('Firebase init failed:', e);
 }
 const getDb = () => {
   if (!db) throw new Error('Firestore not initialized yet');
@@ -35,21 +38,21 @@ const getDb = () => {
 };
 
 // ==============================
-// Express 準備
+// Express Setup
 // ==============================
 const app = express();
 
-// ---- health (監視用)
+// Health check for Render
 app.get('/', (_, res) => res.send('LINE Bot is running!'));
 app.get('/healthz', (_, res) => res.send('healthy'));
 
 // ==============================
-// LINE 設定
+// LINE Setup
 // ==============================
 const client = new line.Client(lineConfig);
 
 // ==============================
-// Firebase 認証ミドルウェア
+// Firebase Auth Middleware
 // ==============================
 const firebaseAuthMiddleware = async (req, res, next) => {
   const authHeader = req.headers.authorization || '';
@@ -71,7 +74,7 @@ const firebaseAuthMiddleware = async (req, res, next) => {
 // Webhook
 // ==============================
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
-  res.sendStatus(200); // 先に成功応答を返す
+  res.sendStatus(200); // Respond immediately
   try {
     await Promise.all((req.body.events || []).map(handleEvent));
   } catch (e) {
@@ -80,12 +83,12 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 });
 
 // ==============================
-// API用 Body Parser
+// API Body Parser
 // ==============================
 app.use(express.json());
 
 // ==============================
-// ユーティリティ
+// Utilities
 // ==============================
 const now = () => Date.now();
 const minutes = (n) => n * 60 * 1000;
@@ -98,10 +101,10 @@ function reply(replyToken, text) {
 }
 
 // ==============================
-// メインイベントハンドラ (LINEからのWebhookイベント処理)
+// Main Event Handler (from LINE Webhook)
 // ==============================
 async function handleEvent(event) {
-  // 1) パートナーがペアコードを送信した時
+  // 1) Partner sends pair code
   if (event.type === 'message' && event.message?.type === 'text') {
     const text = (event.message.text || '').trim();
     const m = /^pair\s+([A-Z0-9]{4,10})$/i.exec(text);
@@ -110,16 +113,14 @@ async function handleEvent(event) {
       const partnerLineUserId = event.source.userId;
       try {
         const dbx = getDb();
-        // ★ codesコレクションから逆引き
         const codeRef = dbx.collection('codes').doc(code);
         const codeSnap = await codeRef.get();
 
         if (!codeSnap.exists || (codeSnap.data().expiresAt || 0) < now()) {
-          return reply(event.replyToken, `コード ${code} は無効か、有効期限切れです。`);
+          return reply(event.replyToken, `Code ${code} is invalid or expired.`);
         }
         const appUserUid = codeSnap.data().appUserUid;
 
-        // userドキュメントを更新してペアリングを完了
         const userRef = dbx.collection('users').doc(appUserUid);
         const partnerProfile = await client.getProfile(partnerLineUserId);
         await userRef.update({
@@ -129,16 +130,16 @@ async function handleEvent(event) {
           'pairingStatus.pairedAt': admin.firestore.FieldValue.serverTimestamp(),
         });
         
-        await codeRef.delete(); // 完了したので逆引きコードを削除
-        return reply(event.replyToken, `ペアリングが完了しました ✅`);
+        await codeRef.delete();
+        return reply(event.replyToken, `Pairing complete! ✅`);
       } catch (error) {
         console.error('pair webhook error', error);
-        return reply(event.replyToken, 'エラーが発生しました。');
+        return reply(event.replyToken, 'An error occurred.');
       }
     }
   }
 
-  // 2) パートナーが解除申請を承認/拒否した時
+  // 2) Partner approves/rejects unlock request
   if (event.type === 'postback') {
     const data = event.postback?.data || '';
     const ap = /^approve:(.+)$/i.exec(data); // approve:{uid}
@@ -153,7 +154,7 @@ async function handleEvent(event) {
           'blockStatus.activatedAt': null,
         });
         if (event.source?.userId) {
-          await client.pushMessage(event.source.userId, { type: 'text', text: '承認しました。' });
+          await client.pushMessage(event.source.userId, { type: 'text', text: 'Approved.' });
         }
       } catch (err) { console.error('Approval failed:', err); }
       return;
@@ -161,7 +162,7 @@ async function handleEvent(event) {
 
     if (rj) {
       if (event.source?.userId) {
-        await client.pushMessage(event.source.userId, { type: 'text', text: '解除申請を拒否しました。' });
+        await client.pushMessage(event.source.userId, { type: 'text', text: 'Rejected unlock request.' });
       }
       return;
     }
@@ -169,10 +170,10 @@ async function handleEvent(event) {
 }
 
 // ==============================
-// 自前 API (Androidアプリからのリクエスト処理)
+// Custom APIs (from Android App)
 // ==============================
 
-// 1) ペアコード発行 API
+// 1) Create Pair Code
 app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
   const appUserUid = req.auth.uid;
   const code = genCode(6).toUpperCase();
@@ -199,7 +200,7 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
   }
 });
 
-// 2) パートナーへの解除申請 API
+// 2) Request Partner Unlock
 app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   try {
@@ -215,12 +216,12 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
     }
 
     await client.pushMessage(partnerLineUserId, {
-      type: 'template', altText: '解除申請が届きました',
+      type: 'template', altText: 'An unlock request has arrived.',
       template: {
-        type: 'confirm', text: 'パートナーからブロック解除の申請が届きました。承認しますか？',
+        type: 'confirm', text: 'A request to unlock the block has arrived from your partner. Do you approve?',
         actions: [
-          { type: 'postback', label: '承認する', data: `approve:${uid}` },
-          { type: 'postback', label: '拒否する', data: `reject:${uid}` },
+          { type: 'postback', label: 'Approve', data: `approve:${uid}` },
+          { type: 'postback', label: 'Reject', data: `reject:${uid}` },
         ],
       },
     });
@@ -231,7 +232,7 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
   }
 });
 
-// ★ 3) 不正検知をパートナーに通知するAPI
+// 3) Notify Partner of Fraud
 app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) => {
     const uid = req.auth.uid;
     try {
@@ -247,7 +248,7 @@ app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) =>
       if (partnerLineUserId && pairingStatus.status === 'paired') {
         const message = {
           type: 'text',
-          text: '【NoMoreBet 警告】\nパートナーのアプリで、ブロック機能の不正な操作（アプリの再インストールなど）が検知されました。現在、ブロック機能は解除されています。'
+          text: '[NoMoreBet Warning]\nFraudulent activity (such as reinstalling the app) was detected on your partner\'s app. The block has been deactivated.'
         };
         await client.pushMessage(partnerLineUserId, message);
       }
@@ -260,13 +261,10 @@ app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) =>
     }
 });
 
-
 // ==============================
-// サーバー起動
+// Start Server
 // ==============================
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`listening on ${PORT}`);
+  initAsync(); // Initialize Firebase after starting the server
 });
-
-// 最初に一度だけ実行
-initAsync();
