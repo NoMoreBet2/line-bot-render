@@ -2,7 +2,8 @@ name: Heartbeat Cron
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 5分ごとに実行
+    # ★ 修正点: 5分ごとから、仕様書通りの15分ごとに変更
+    - cron: "*/15 * * * *"
   workflow_dispatch:        # 手動実行も可能（Actions画面からRun）
 
 jobs:
@@ -12,9 +13,7 @@ jobs:
     steps:
       - name: Call Render heartbeat endpoint (with retry)
         env:
-          # Render のあなたのサービスURL。必要なら後で変えてOK
           BASE: https://line-bot-render-gx3a.onrender.com
-          # さきほどGitHub Secretsに登録した値
           SECRET: ${{ secrets.CRON_SECRET }}
         run: |
           set -euo pipefail
