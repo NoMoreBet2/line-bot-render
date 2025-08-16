@@ -267,6 +267,3 @@ app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) =>
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`listening on ${PORT}`);
 });
-
-// 最初に一度だけ実行
-initAsync();
