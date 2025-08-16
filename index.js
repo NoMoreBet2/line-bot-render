@@ -3,48 +3,36 @@
 const express = require('express');
 const line = require('@line/bot-sdk');
 const admin = require('firebase-admin');
+const crypto = require('crypto');
 
 // ==============================
 // 環境変数
 // ==============================
-// ※ Render などの環境に必ず設定
-// CHANNEL_ACCESS_TOKEN : LINE 長期チャネルアクセストークン
-// CHANNEL_SECRET       : LINE チャネルシークレット
-// FIREBASE_SERVICE_ACCOUNT_JSON : サービスアカウントJSON（文字列; 未設定ならADCで初期化）
 const PORT = process.env.PORT || 3000;
+const lineConfig = {
+  channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
+  channelSecret: process.env.CHANNEL_SECRET,
+};
 
 // ==============================
 // Firebase Admin 初期化
 // ==============================
 let db = null;
-async function initAsync() {
+try {
   const sa = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  try {
-    if (sa) {
-      admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
-    } else {
-      // 環境のADCを使う（Render等では未設定なら失敗するのでログ確認）
-      admin.initializeApp();
-    }
-    db = admin.firestore();
-    console.log('Firestore handle obtained');
-  } catch (e) {
-    console.error('Firebase init failed:', e);
+  if (sa) {
+    admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
+  } else {
+    admin.initializeApp();
   }
+  db = admin.firestore();
+} catch (e) {
+  console.error('Firebase init failed:', e);
 }
 const getDb = () => {
   if (!db) throw new Error('Firestore not initialized yet');
   return db;
 };
-
-// ==============================
-// LINE 設定
-// ==============================
-const lineConfig = {
-  channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
-  channelSecret: process.env.CHANNEL_SECRET,
-};
-const client = new line.Client(lineConfig);
 
 // ==============================
 // Express 準備
@@ -56,30 +44,12 @@ app.get('/', (_, res) => res.send('LINE Bot is running!'));
 app.get('/healthz', (_, res) => res.send('healthy'));
 
 // ==============================
-// Webhook（最優先で定義！）
-// - @line/bot-sdk の middleware が署名検証と raw ボディ処理を担当
-// - 他の body parser（express.json 等）より前に置く
+// LINE 設定
 // ==============================
-app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
-  // 先に 200 を返す（LINE には成功扱いにする）
-  res.sendStatus(200);
-
-  try {
-    const events = req.body?.events || [];
-    await Promise.all(events.map(handleEvent));
-  } catch (e) {
-    console.error('webhook error', e);
-  }
-});
+const client = new line.Client(lineConfig);
 
 // ==============================
-// ここから下は通常の JSON API 用
-// webhook より後に body parser を入れる
-// ==============================
-app.use(express.json());
-
-// ==============================
-// Firebase 認証ミドルウェア（アプリの自前API向け）
+// Firebase 認証ミドルウェア
 // ==============================
 const firebaseAuthMiddleware = async (req, res, next) => {
   const authHeader = req.headers.authorization || '';
@@ -98,6 +68,23 @@ const firebaseAuthMiddleware = async (req, res, next) => {
 };
 
 // ==============================
+// Webhook
+// ==============================
+app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
+  res.sendStatus(200); // 先に成功応答を返す
+  try {
+    await Promise.all((req.body.events || []).map(handleEvent));
+  } catch (e) {
+    console.error('webhook error', e);
+  }
+});
+
+// ==============================
+// API用 Body Parser
+// ==============================
+app.use(express.json());
+
+// ==============================
 // ユーティリティ
 // ==============================
 const now = () => Date.now();
@@ -111,10 +98,10 @@ function reply(replyToken, text) {
 }
 
 // ==============================
-// メインイベントハンドラ
+// メインイベントハンドラ (LINEからのWebhookイベント処理)
 // ==============================
 async function handleEvent(event) {
-  // 1) テキストメッセージ（ペアコード受信）
+  // 1) パートナーがペアコードを送信した時
   if (event.type === 'message' && event.message?.type === 'text') {
     const text = (event.message.text || '').trim();
     const m = /^pair\s+([A-Z0-9]{4,10})$/i.exec(text);
@@ -123,30 +110,27 @@ async function handleEvent(event) {
       const partnerLineUserId = event.source.userId;
       try {
         const dbx = getDb();
-        const usersQuery = await dbx.collection('users').where('pairingStatus.code', '==', code).limit(1).get();
-        if (usersQuery.empty) return reply(event.replyToken, `コード ${code} は見つかりません。`);
+        // ★ codesコレクションから逆引き
+        const codeRef = dbx.collection('codes').doc(code);
+        const codeSnap = await codeRef.get();
 
-        const userDoc = usersQuery.docs[0];
-        const appUserUid = userDoc.id;
-        const pairingStatus = userDoc.data().pairingStatus || {};
+        if (!codeSnap.exists || (codeSnap.data().expiresAt || 0) < now()) {
+          return reply(event.replyToken, `コード ${code} は無効か、有効期限切れです。`);
+        }
+        const appUserUid = codeSnap.data().appUserUid;
 
-        if ((pairingStatus.expiresAt || 0) < now()) return reply(event.replyToken, `コード ${code} の有効期限が切れています。`);
-        if (pairingStatus.status === 'paired') return reply(event.replyToken, `このコードは既に使用済みです。`);
-
-        const partnerProfile = await client.getProfile(partnerLineUserId);
-        const newPairingStatus = {
-          ...pairingStatus,
-          status: 'paired',
-          pairedAt: admin.firestore.FieldValue.serverTimestamp(),
-          partnerLineUserId,
-          partnerDisplayName: partnerProfile.displayName,
-        };
-
+        // userドキュメントを更新してペアリングを完了
         const userRef = dbx.collection('users').doc(appUserUid);
-        await userRef.update({ pairingStatus: newPairingStatus });
-        await dbx.collection('codes').doc(code).delete(); // 逆引きコードを削除
-
-        return reply(event.replyToken, `ペアリング完了しました ✅`);
+        const partnerProfile = await client.getProfile(partnerLineUserId);
+        await userRef.update({
+          'pairingStatus.status': 'paired',
+          'pairingStatus.partnerLineUserId': partnerLineUserId,
+          'pairingStatus.partnerDisplayName': partnerProfile.displayName,
+          'pairingStatus.pairedAt': admin.firestore.FieldValue.serverTimestamp(),
+        });
+        
+        await codeRef.delete(); // 完了したので逆引きコードを削除
+        return reply(event.replyToken, `ペアリングが完了しました ✅`);
       } catch (error) {
         console.error('pair webhook error', error);
         return reply(event.replyToken, 'エラーが発生しました。');
@@ -154,7 +138,7 @@ async function handleEvent(event) {
     }
   }
 
-  // 2) ポストバック（承認/拒否）
+  // 2) パートナーが解除申請を承認/拒否した時
   if (event.type === 'postback') {
     const data = event.postback?.data || '';
     const ap = /^approve:(.+)$/i.exec(data); // approve:{uid}
@@ -171,9 +155,7 @@ async function handleEvent(event) {
         if (event.source?.userId) {
           await client.pushMessage(event.source.userId, { type: 'text', text: '承認しました。' });
         }
-      } catch (err) {
-        console.error('Approval failed:', err);
-      }
+      } catch (err) { console.error('Approval failed:', err); }
       return;
     }
 
@@ -184,16 +166,13 @@ async function handleEvent(event) {
       return;
     }
   }
-
-  // その他イベントは無視
-  return;
 }
 
 // ==============================
-// 自前 API
+// 自前 API (Androidアプリからのリクエスト処理)
 // ==============================
 
-// 1) ペアコード発行
+// 1) ペアコード発行 API
 app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
   const appUserUid = req.auth.uid;
   const code = genCode(6).toUpperCase();
@@ -201,19 +180,17 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
   try {
     const dbx = getDb();
     const batch = dbx.batch();
-
-    // 逆引き用 codes コレクション
+    
     const codeRef = dbx.collection('codes').doc(code);
     batch.set(codeRef, { appUserUid, expiresAt });
 
-    // ユーザーの pairingStatus 更新
     const userRef = dbx.collection('users').doc(appUserUid);
     batch.update(userRef, {
       'pairingStatus.code': code,
       'pairingStatus.expiresAt': expiresAt,
       'pairingStatus.status': 'waiting',
     });
-
+    
     await batch.commit();
     res.json({ code, expiresAt });
   } catch (e) {
@@ -222,7 +199,7 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
   }
 });
 
-// 2) パートナーへの解除申請（Confirm テンプレ送信）
+// 2) パートナーへの解除申請 API
 app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   try {
@@ -238,11 +215,9 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
     }
 
     await client.pushMessage(partnerLineUserId, {
-      type: 'template',
-      altText: '解除申請が届きました',
+      type: 'template', altText: '解除申請が届きました',
       template: {
-        type: 'confirm',
-        text: 'パートナーからブロック解除の申請が届きました。承認しますか？',
+        type: 'confirm', text: 'パートナーからブロック解除の申請が届きました。承認しますか？',
         actions: [
           { type: 'postback', label: '承認する', data: `approve:${uid}` },
           { type: 'postback', label: '拒否する', data: `reject:${uid}` },
@@ -256,10 +231,42 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
   }
 });
 
+// ★ 3) 不正検知をパートナーに通知するAPI
+app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) => {
+    const uid = req.auth.uid;
+    try {
+      const dbx = getDb();
+      const userSnap = await dbx.collection('users').doc(uid).get();
+      if (!userSnap.exists) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+  
+      const pairingStatus = userSnap.data().pairingStatus || {};
+      const partnerLineUserId = pairingStatus.partnerLineUserId;
+  
+      if (partnerLineUserId && pairingStatus.status === 'paired') {
+        const message = {
+          type: 'text',
+          text: '【NoMoreBet 警告】\nパートナーのアプリで、ブロック機能の不正な操作（アプリの再インストールなど）が検知されました。現在、ブロック機能は解除されています。'
+        };
+        await client.pushMessage(partnerLineUserId, message);
+      }
+      
+      res.json({ ok: true });
+  
+    } catch (e) {
+      console.error('Failed to notify partner of fraud:', e);
+      res.status(500).json({ error: 'Failed to notify partner.' });
+    }
+});
+
+
 // ==============================
 // サーバー起動
 // ==============================
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`listening on ${PORT}`);
-  initAsync().catch((e) => console.error('initAsync fatal:', e));
 });
+
+// 最初に一度だけ実行
+initAsync();
