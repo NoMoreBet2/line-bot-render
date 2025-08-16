@@ -19,16 +19,19 @@ const lineConfig = {
 // Firebase Admin 初期化
 // ==============================
 let db = null;
-try {
+async function initAsync() {
   const sa = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (sa) {
-    admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
-  } else {
-    admin.initializeApp();
+  try {
+    if (sa) {
+      admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
+    } else {
+      admin.initializeApp();
+    }
+    db = admin.firestore();
+    console.log('Firestore handle obtained');
+  } catch (e) {
+    console.error('Firebase init failed:', e);
   }
-  db = admin.firestore();
-} catch (e) {
-  console.error('Firebase init failed:', e);
 }
 const getDb = () => {
   if (!db) throw new Error('Firestore not initialized yet');
@@ -100,7 +103,7 @@ function reply(replyToken, text) {
 // メインイベントハンドラ (LINEからのWebhookイベント処理)
 // ==============================
 async function handleEvent(event) {
-    // (ペアリングと解除承認のロジックは変更ありません)
+    // 1) パートナーがペアコードを送信した時
     if (event.type === 'message' && event.message?.type === 'text') {
         const text = (event.message.text || '').trim();
         const m = /^pair\s+([A-Z0-9]{4,10})$/i.exec(text);
@@ -134,9 +137,12 @@ async function handleEvent(event) {
           }
         }
     }
+    // 2) パートナーが解除申請を承認/拒否した時
     if (event.type === 'postback') {
         const data = event.postback?.data || '';
         const ap = /^approve:(.+)$/i.exec(data);
+        const rj = /^reject:(.+)$/i.exec(data);
+
         if (ap) {
           const appUserUid = ap[1];
           try {
@@ -149,6 +155,13 @@ async function handleEvent(event) {
               await client.pushMessage(event.source.userId, { type: 'text', text: '承認しました。' });
             }
           } catch (err) { console.error('Approval failed:', err); }
+          return;
+        }
+        if (rj) {
+            if (event.source?.userId) {
+              await client.pushMessage(event.source.userId, { type: 'text', text: '解除申請を拒否しました。' });
+            }
+            return;
         }
     }
 }
@@ -157,7 +170,7 @@ async function handleEvent(event) {
 // 自前 API (Androidアプリからのリクエスト処理)
 // ==============================
 
-// (ペアコード発行、解除申請、不正通知APIは変更ありません)
+// 1) ペアコード発行 API
 app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
     const appUserUid = req.auth.uid;
     const code = genCode(6).toUpperCase();
@@ -180,6 +193,8 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
       res.status(500).json({ error: 'Failed to issue a pair code.' });
     }
 });
+
+// 2) パートナーへの解除申請 API
 app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => {
     const uid = req.auth.uid;
     try {
@@ -207,6 +222,8 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
       res.status(500).json({ error: 'Failed to process unlock request.' });
     }
 });
+
+// 3) 不正検知をパートナーに通知するAPI
 app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) => {
     const uid = req.auth.uid;
     try {
@@ -235,7 +252,6 @@ app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
         const dbx = getDb();
         const userRef = dbx.collection('users').doc(uid);
 
-        // まず、返事待ちリストをチェック
         const pendingPingsQuery = await userRef.collection('pendingPings').limit(1).get();
         if (!pendingPingsQuery.empty) {
             // 不正確定！
@@ -254,14 +270,12 @@ app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
                     text: '【NoMoreBet 警告】\nパートナーのアプリで不正な操作（セーフモード利用の可能性）が検知されました。ブロックは解除されています。'
                 });
             }
-            // 不正検知後、保留中のpingは全てクリア
             const allPings = await userRef.collection('pendingPings').get();
             const batch = dbx.batch();
             allPings.docs.forEach(doc => batch.delete(doc.ref));
             await batch.commit();
         }
 
-        // 不正がなければ、通常のハートビートを更新
         await userRef.update({ 'blockStatus.lastHeartbeat': admin.firestore.FieldValue.serverTimestamp() });
         res.json({ ok: true });
     } catch (e) {
@@ -292,20 +306,20 @@ app.get('/cron/check-heartbeats', async (req, res) => {
   
     const dbx = getDb();
     const now = admin.firestore.Timestamp.now();
-    const staleCutoff = admin.firestore.Timestamp.fromMillis(now.toMillis() - minutes(20)); // 20分前
-    const longOfflineCutoff = admin.firestore.Timestamp.fromMillis(now.toMillis() - minutes(24 * 60)); // 24時間前
+    const staleCutoff = admin.firestore.Timestamp.fromMillis(now.toMillis() - minutes(20));
+    const longOfflineCutoff = admin.firestore.Timestamp.fromMillis(now.toMillis() - minutes(24 * 60));
   
     try {
       const staleUsersQuery = await dbx.collection('users')
         .where('blockStatus.isActive', '==', true)
         .where('blockStatus.lastHeartbeat', '<', staleCutoff)
-        .where('blockStatus.lastHeartbeat', '>', longOfflineCutoff) // 24時間以上オフラインのユーザーは除外
+        .where('blockStatus.lastHeartbeat', '>', longOfflineCutoff)
         .get();
   
       for (const userDoc of staleUsersQuery.docs) {
         const uid = userDoc.id;
         const userData = userDoc.data();
-        const fcmToken = userData.deviceStatus?.fcmToken;
+        const fcmToken = userData.deviceStatus?.fcmToken; // fcmTokenはdeviceStatusにあると仮定
   
         if (fcmToken) {
           const pingId = crypto.randomUUID();
