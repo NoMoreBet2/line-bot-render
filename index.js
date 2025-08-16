@@ -260,6 +260,107 @@ app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) =>
     }
 });
 
+// ==============================
+// 4) ハートビート監視用 Cron エンドポイント
+// GET /cron/check-heartbeats?secret=xxxxx
+// ==============================
+const CRON_SECRET = process.env.CRON_SECRET || '';
+const STALE_MINUTES = parseInt(process.env.HEARTBEAT_STALE_MINUTES || '20', 10);   // 20分以上無通信でstale扱い
+const PARTNER_NOTIFY_COOLDOWN_MIN = parseInt(process.env.PARTNER_NOTIFY_COOLDOWN_MIN || '60', 10); // パートナー通知の再送間隔
+
+app.get('/cron/check-heartbeats', async (req, res) => {
+  try {
+    if (!CRON_SECRET || req.query.secret !== CRON_SECRET) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const dbx = getDb();
+    const cutoff = admin.firestore.Timestamp.fromMillis(Date.now() - STALE_MINUTES * 60 * 1000);
+
+    // lastHeartbeat が cutoff より古いユーザを抽出
+    const q = await dbx
+      .collection('users')
+      .where('deviceStatus.lastHeartbeat', '<', cutoff)
+      .get();
+
+    let checked = 0;
+    let fcmTriggered = 0;
+    let partnerNotified = 0;
+
+    for (const doc of q.docs) {
+      checked++;
+      const data = doc.data() || {};
+      const deviceStatus = data.deviceStatus || {};
+      const pairingStatus = data.pairingStatus || {};
+      const uid = data.uid || doc.id;
+
+      const lastHeartbeat = deviceStatus.lastHeartbeat; // Firestore Timestamp
+      const fcmToken = deviceStatus.fcmToken;
+      const partnerLineUserId = pairingStatus.partnerLineUserId;
+      const pairingStatusStr = pairingStatus.status;
+
+      // 1) 端末に「今すぐ心拍」を要求（FCM データメッセージ）
+      if (fcmToken) {
+        try {
+          await admin.messaging().send({
+            token: fcmToken,
+            data: { action: 'heartbeat_now' },
+            android: { priority: 'high' },
+          });
+          fcmTriggered++;
+          // 任意: 送信時刻を保存（デバッグ用）
+          await doc.ref.set(
+            { deviceStatus: { lastHeartbeatPingSentAt: admin.firestore.FieldValue.serverTimestamp() } },
+            { merge: true }
+          );
+        } catch (e) {
+          console.error('FCM send error uid=', uid, e);
+        }
+      }
+
+      // 2) パートナーへの通知（連投防止: PARTNER_NOTIFY_COOLDOWN_MIN 分）
+      const alerts = data.alerts || {};
+      const offlineNotifiedAt = alerts.offlineNotifiedAt; // Firestore Timestamp
+      const nowTs = admin.firestore.Timestamp.now();
+
+      const shouldNotifyPartner =
+        partnerLineUserId &&
+        pairingStatusStr === 'paired' &&
+        (!offlineNotifiedAt ||
+          (nowTs.toMillis() - offlineNotifiedAt.toMillis()) > PARTNER_NOTIFY_COOLDOWN_MIN * 60 * 1000);
+
+      if (shouldNotifyPartner) {
+        try {
+          const lastStr = lastHeartbeat ? new Date(lastHeartbeat.toMillis()).toLocaleString('ja-JP') : '不明';
+          await client.pushMessage(partnerLineUserId, {
+            type: 'text',
+            text: `【NoMoreBet】\nパートナー端末のハートビートが途絶えています（最終: ${lastStr}）。\nアプリ側に復旧を依頼しました。しばらくしても改善しない場合はご確認ください。`,
+          });
+          await doc.ref.set(
+            { alerts: { offlineNotifiedAt: admin.firestore.FieldValue.serverTimestamp() } },
+            { merge: true }
+          );
+          partnerNotified++;
+        } catch (e) {
+          console.error('LINE notify error uid=', uid, e);
+        }
+      }
+    }
+
+    return res.json({
+      ok: true,
+      checked,
+      fcmTriggered,
+      partnerNotified,
+      staleMinutes: STALE_MINUTES,
+    });
+  } catch (e) {
+    console.error('cron/check-heartbeats error', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
 
 // ==============================
 // サーバー起動
