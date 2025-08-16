@@ -1,0 +1,38 @@
+name: Heartbeat Cron
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # 5分ごとに実行
+  workflow_dispatch:        # 手動実行も可能（Actions画面からRun）
+
+jobs:
+  call-cron:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Call Render heartbeat endpoint (with retry)
+        env:
+          # Render のあなたのサービスURL。必要なら後で変えてOK
+          BASE: https://line-bot-render-gx3a.onrender.com
+          # さきほどGitHub Secretsに登録した値
+          SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          URL="$BASE/cron/check-heartbeats?secret=$SECRET"
+          echo "Calling $URL at $(date -u)..."
+
+          # 最大3回リトライ
+          for i in 1 2 3; do
+            HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" "$URL" || echo 000)
+            echo "HTTP $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Response:"
+              cat response.json
+              exit 0
+            fi
+            echo "Retrying in 20s ($i/3)..."
+            sleep 20
+          done
+
+          echo "Failed to call endpoint after 3 attempts."
+          exit 1
