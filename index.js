@@ -157,6 +157,7 @@ async function handleEvent(event) {
       const appUserUid = ap[1];
       try {
         const userRef = getDb().collection('users').doc(appUserUid);
+        // ★★★ 修正点1: パートナーの承認時はブロックを「解除」するのが正しい動作
         await userRef.update({
           'blockStatus.isActive': false,
           'blockStatus.activatedAt': null,
@@ -273,15 +274,16 @@ app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
       const pairingStatus = (await userRef.get()).data()?.pairingStatus || {};
       const partnerLineUserId = pairingStatus.partnerLineUserId;
 
+      // ★★★ 修正点2: 不正検知時は期間を「リセット」する
       await userRef.update({
-        'blockStatus.isActive': false,
-        'blockStatus.activatedAt': null
+        'blockStatus.activatedAt': admin.firestore.FieldValue.serverTimestamp()
       });
 
       if (partnerLineUserId) {
+        // ★★★ 修正点3: パートナーへの通知メッセージを修正
         await client.pushMessage(partnerLineUserId, {
           type: 'text',
-          text: '【NoMoreBet 警告】\nパートナーのアプリで不正な操作（セーフモード利用の可能性）が検知されました。ブロックは解除されています。'
+          text: '【NoMoreBet 警告】\nパートナーのアプリで不正な操作（セーフモード利用の可能性）が検知されたため、連続ブロック期間がリセットされました。'
         });
       }
       const allPings = await userRef.collection('pendingPings').get();
