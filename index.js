@@ -21,7 +21,6 @@ const lineConfig = {
 let db = null;
 async function initAsync() {
   if (admin.apps.length) {
-    // 既に初期化済み
     db = admin.firestore();
     return;
   }
@@ -49,7 +48,6 @@ const getDb = () => {
 // ==============================
 const app = express();
 
-// ---- health (監視用)
 app.get('/', (_, res) => res.send('LINE Bot is running!'));
 app.get('/healthz', (_, res) => res.send('healthy'));
 
@@ -79,7 +77,6 @@ const firebaseAuthMiddleware = async (req, res, next) => {
 
 // ==============================
 // Webhook
-// ＊line.middleware は生ボディを使うため express.json() より前に置く
 // ==============================
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   res.sendStatus(200);
@@ -90,9 +87,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   }
 });
 
-// ==============================
-// API用 Body Parser（Webhookの後）
-// ==============================
 app.use(express.json());
 
 // ==============================
@@ -100,6 +94,7 @@ app.use(express.json());
 // ==============================
 const now = () => Date.now();
 const minutes = (n) => n * 60 * 1000;
+const hours = (n) => n * 60 * 60 * 1000; // 時間計算用のヘルパー
 const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 function genCode(len = 6) {
   return Array.from({ length: len }, () => ALPHABET[Math.floor(Math.random() * ALPHABET.length)]).join('');
@@ -112,7 +107,6 @@ function reply(replyToken, text) {
 // メインイベントハンドラ (LINEからのWebhookイベント処理)
 // ==============================
 async function handleEvent(event) {
-  // 1) ペアコード
   if (event.type === 'message' && event.message?.type === 'text') {
     const text = (event.message.text || '').trim();
     const m = /^pair\s+([A-Z0-9]{4,10})$/i.exec(text);
@@ -123,12 +117,10 @@ async function handleEvent(event) {
         const dbx = getDb();
         const codeRef = dbx.collection('codes').doc(code);
         const codeSnap = await codeRef.get();
-
         if (!codeSnap.exists || (codeSnap.data().expiresAt.toMillis?.() || 0) < now()) {
           return reply(event.replyToken, `コード ${code} は無効か、有効期限切れです。`);
         }
         const appUserUid = codeSnap.data().appUserUid;
-
         const userRef = dbx.collection('users').doc(appUserUid);
         const partnerProfile = await client.getProfile(partnerLineUserId);
         await userRef.update({
@@ -137,7 +129,6 @@ async function handleEvent(event) {
           'pairingStatus.partnerDisplayName': partnerProfile.displayName,
           'pairingStatus.pairedAt': admin.firestore.FieldValue.serverTimestamp(),
         });
-
         await codeRef.delete();
         return reply(event.replyToken, `ペアリングが完了しました ✅`);
       } catch (error) {
@@ -146,18 +137,14 @@ async function handleEvent(event) {
       }
     }
   }
-
-  // 2) 解除申請 承認/拒否
   if (event.type === 'postback') {
     const data = event.postback?.data || '';
     const ap = /^approve:(.+)$/i.exec(data);
     const rj = /^reject:(.+)$/i.exec(data);
-
     if (ap) {
       const appUserUid = ap[1];
       try {
         const userRef = getDb().collection('users').doc(appUserUid);
-        // ★★★ 修正点1: パートナーの承認時はブロックを「解除」するのが正しい動作
         await userRef.update({
           'blockStatus.isActive': false,
           'blockStatus.activatedAt': null,
@@ -182,8 +169,6 @@ async function handleEvent(event) {
 // ==============================
 // 自前 API (Androidアプリからのリクエスト処理)
 // ==============================
-
-// 1) ペアコード発行 API
 app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
   const appUserUid = req.auth.uid;
   const code = genCode(6).toUpperCase();
@@ -207,7 +192,6 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
   }
 });
 
-// 2) パートナーへの解除申請 API
 app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   try {
@@ -238,7 +222,6 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
   }
 });
 
-// 3) 不正検知をパートナーに通知するAPI
 app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   try {
@@ -250,7 +233,7 @@ app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) =>
     if (partnerLineUserId && pairingStatus.status === 'paired') {
       await client.pushMessage(partnerLineUserId, {
         type: 'text',
-        text: '【NoMoreBet 警告】\nパートナーのアプリで、ブロック機能の不正な操作が検知されました。現在、ブロック機能は解除されています。'
+        text: '【NoMoreBet 警告】\nパートナーのアプリで、ブロック機能の不正な操作が検知されました。現在、ブロック機能は解除されています。',
       });
     }
     res.json({ ok: true });
@@ -266,32 +249,33 @@ app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
   try {
     const dbx = getDb();
     const userRef = dbx.collection('users').doc(uid);
-
     const pendingPingsQuery = await userRef.collection('pendingPings').limit(1).get();
     if (!pendingPingsQuery.empty) {
-      // 不正確定！
-      console.log(`[heartbeat] Fraud detected for user ${uid}. Heartbeat received while pings are pending.`);
-      const pairingStatus = (await userRef.get()).data()?.pairingStatus || {};
-      const partnerLineUserId = pairingStatus.partnerLineUserId;
-
-      // ★★★ 修正点2: 不正検知時は期間を「リセット」する
-      await userRef.update({
-        'blockStatus.activatedAt': admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      if (partnerLineUserId) {
-        // ★★★ 修正点3: パートナーへの通知メッセージを修正
-        await client.pushMessage(partnerLineUserId, {
-          type: 'text',
-          text: '【NoMoreBet 警告】\nパートナーのアプリで不正な操作（セーフモード利用の可能性）が検知されたため、連続ブロック期間がリセットされました。'
+      const latestPing = pendingPingsQuery.docs[0].data();
+      const pingSentAt = latestPing.sentAt.toMillis();
+      const nowMs = Date.now();
+      const GRACE_PERIOD_MS = 30 * 1000;
+      if (nowMs - pingSentAt < GRACE_PERIOD_MS) {
+        console.log(`[heartbeat] Ignored potential fraud for user ${uid} within grace period.`);
+      } else {
+        console.log(`[heartbeat] Fraud detected for user ${uid}. Heartbeat received while pings are pending.`);
+        const pairingStatus = (await userRef.get()).data()?.pairingStatus || {};
+        const partnerLineUserId = pairingStatus.partnerLineUserId;
+        await userRef.update({
+          'blockStatus.activatedAt': admin.firestore.FieldValue.serverTimestamp(),
         });
+        if (partnerLineUserId) {
+          await client.pushMessage(partnerLineUserId, {
+            type: 'text',
+            text: '【NoMoreBet 警告】\nパートナーのアプリで不正な操作（セーフモード利用の可能性）が検知されたため、連続ブロック期間がリセットされました。',
+          });
+        }
       }
       const allPings = await userRef.collection('pendingPings').get();
       const batch = dbx.batch();
-      allPings.docs.forEach(doc => batch.delete(doc.ref));
+      allPings.docs.forEach((doc) => batch.delete(doc.ref));
       await batch.commit();
     }
-
     await userRef.update({ 'blockStatus.lastHeartbeat': admin.firestore.FieldValue.serverTimestamp() });
     res.json({ ok: true });
   } catch (e) {
@@ -324,6 +308,31 @@ app.get('/cron/check-heartbeats', async (req, res) => {
 
   const dbx = getDb();
   const nowTs = admin.firestore.Timestamp.now();
+
+  // ▼▼▼ 新規追加: 古い(48時間以上)pendingPingsを削除するゴミ掃除処理 ▼▼▼
+  try {
+    const cleanupCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - hours(48));
+    const allUsers = await dbx.collection('users').get();
+    let cleanedCount = 0;
+    for (const userDoc of allUsers.docs) {
+      const pingsToCleanQuery = await userDoc.ref.collection('pendingPings').where('sentAt', '<', cleanupCutoff).get();
+      if (!pingsToCleanQuery.empty) {
+        const batch = dbx.batch();
+        pingsToCleanQuery.docs.forEach(doc => batch.delete(doc.ref));
+        await batch.commit();
+        cleanedCount += pingsToCleanQuery.size;
+        console.log(`[cron-cleanup] Cleaned ${pingsToCleanQuery.size} old pings for user ${userDoc.id}`);
+      }
+    }
+    if (cleanedCount > 0) {
+        console.log(`[cron-cleanup] Total old pings cleaned: ${cleanedCount}`);
+    }
+  } catch (e) {
+    console.error('[cron-cleanup] failed', e);
+    // This part is not critical, so we don't stop the main cron job.
+  }
+  // ▲▲▲ ゴミ掃除処理ここまで ▲▲▲
+
   const staleCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - minutes(20));
   const longOfflineCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - minutes(24 * 60));
 
@@ -349,17 +358,14 @@ app.get('/cron/check-heartbeats', async (req, res) => {
       const uid = userDoc.id;
       const userData = userDoc.data();
       const fcmToken = userData.deviceStatus?.fcmToken;
-
       if (!fcmToken) {
         skippedNoToken.push(uid);
         console.warn('[cron] skip (no fcmToken) -> %s', uid);
         continue;
       }
-
       const pingId = crypto.randomUUID();
       const pingRef = userDoc.ref.collection('pendingPings').doc(pingId);
       await pingRef.set({ sentAt: nowTs, by: 'cron' });
-
       try {
         await admin.messaging().send({
           token: fcmToken,
@@ -372,7 +378,6 @@ app.get('/cron/check-heartbeats', async (req, res) => {
         console.error('[cron] FCM send error -> %s :', uid, sendErr);
       }
     }
-
     console.log('[cron] done | sent=%d | skipped(noToken)=%d', sent.length, skippedNoToken.length);
     return res.json({ ok: true, checked: q.size, sent, skippedNoToken });
   } catch (e) {
