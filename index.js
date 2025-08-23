@@ -94,7 +94,7 @@ app.use(express.json());
 // ==============================
 const now = () => Date.now();
 const minutes = (n) => n * 60 * 1000;
-const hours = (n) => n * 60 * 60 * 1000; // 時間計算用のヘルパー
+const hours = (n) => n * 60 * 60 * 1000;
 const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 function genCode(len = 6) {
   return Array.from({ length: len }, () => ALPHABET[Math.floor(Math.random() * ALPHABET.length)]).join('');
@@ -314,21 +314,24 @@ app.get('/cron/check-heartbeats', async (req, res) => {
   const dbx = getDb();
   const nowTs = admin.firestore.Timestamp.now();
 
-  // ▼▼▼ 新規追加: 古い(48時間以上)pendingPingsを削除するゴミ掃除処理 ▼▼▼
+  // ▼▼▼ 修正点: 古い(48時間以上)pendingPingsを削除するゴミ掃除処理 ▼▼▼
   try {
     const cleanupCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - hours(48));
     const allUsers = await dbx.collection('users').get();
     let cleanedCount = 0;
+
+    // ユーザーごとに非同期処理を待つように修正
     for (const userDoc of allUsers.docs) {
       const pingsToCleanQuery = await userDoc.ref.collection('pendingPings').where('sentAt', '<', cleanupCutoff).get();
       if (!pingsToCleanQuery.empty) {
         const batch = dbx.batch();
         pingsToCleanQuery.docs.forEach(doc => batch.delete(doc.ref));
-        await batch.commit();
+        await batch.commit(); // ユーザーごとにバッチをコミット
         cleanedCount += pingsToCleanQuery.size;
         console.log(`[cron-cleanup] Cleaned ${pingsToCleanQuery.size} old pings for user ${userDoc.id}`);
       }
     }
+
     if (cleanedCount > 0) {
         console.log(`[cron-cleanup] Total old pings cleaned: ${cleanedCount}`);
     }
