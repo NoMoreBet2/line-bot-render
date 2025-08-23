@@ -230,6 +230,7 @@ app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) =>
     const pairingStatus = userSnap.data().pairingStatus || {};
     const partnerLineUserId = pairingStatus.partnerLineUserId;
     if (partnerLineUserId && pairingStatus.status === 'paired') {
+      // 注意：このAPIは別途修正が必要な場合があります
       await client.pushMessage(partnerLineUserId, {
         type: 'text',
         text: '【NoMoreBet 警告】\nパートナーのアプリで、ブロック機能の不正な操作が検知されました。現在、ブロック機能は解除されています。',
@@ -242,49 +243,42 @@ app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) =>
   }
 });
 
-// ★ 4) ハートビート受信 & 不正最終判断 (最終版ロジック)
+// ★ 4) ハートビート受信 & 不正最終判断 (あなたの指示による最終ロジック)
 app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   try {
     const dbx = getDb();
     const userRef = dbx.collection('users').doc(uid);
 
-    // ▼▼▼ ここからが新しい不正検知のロジック ▼▼▼
+    const pendingPingsQuery = await userRef.collection('pendingPings').get();
+    const userSnap = await userRef.get();
+    const blockStatus = userSnap.data()?.blockStatus || {};
 
-    // アプリから「再起動した」という証明書が送られてきたか確認
-    const wasRebooted = req.body?.rebooted === true;
-
-    if (wasRebooted) {
-      // --- ケース1: 再起動の証明書がある場合 ---
-      // 電源オフが理由であることが確定なので、無条件でセーフとする。
-      console.log(`[heartbeat] Received heartbeat with reboot flag for user ${uid}. Clearing all pending pings.`);
-      
-      const allPings = await userRef.collection('pendingPings').get();
-      if (!allPings.empty) {
-        const batch = dbx.batch();
-        allPings.docs.forEach((doc) => batch.delete(doc.ref));
-        await batch.commit();
+    if (pendingPingsQuery.empty) {
+      // --- ケース1: 未処理のpingがない場合（正常） ---
+      if (blockStatus.suspicionDetectedAt) {
+        // もし警告状態だったら、正常に戻ったので警告を解除する
+        await userRef.update({ 'blockStatus.suspicionDetectedAt': null });
+        console.log(`[heartbeat] User ${uid} recovered from suspicion. Flag cleared.`);
       }
-
     } else {
-      // --- ケース2: 再起動の証明書がない場合（通常のチェック）---
-      const pendingPingsQuery = await userRef.collection('pendingPings').limit(1).get();
-      if (!pendingPingsQuery.empty) {
-        const latestPing = pendingPingsQuery.docs[0].data();
-        const pingSentAt = latestPing.sentAt.toMillis();
+      // --- ケース2: 未処理のpingがある場合（警告または不正） ---
+      if (blockStatus.suspicionDetectedAt) {
+        // -- 2a: すでに警告状態の場合 --
+        const suspicionTime = blockStatus.suspicionDetectedAt.toMillis();
         const nowMs = Date.now();
-        const GRACE_PERIOD_MS = 30 * 1000;
-        
-        if (nowMs - pingSentAt < GRACE_PERIOD_MS) {
-          // 猶予期間内なら、スリープ復帰とみなし不正ではない
-          console.log(`[heartbeat] Ignored potential fraud for user ${uid} within grace period.`);
-        } else {
-          // 猶予期間外なら、セーフモードなどの不正と確定
-          console.log(`[heartbeat] Fraud detected for user ${uid}. Heartbeat received while pings are pending.`);
-          const pairingStatus = (await userRef.get()).data()?.pairingStatus || {};
+        const THIRTY_MINUTES_MS = 30 * 60 * 1000;
+
+        if (nowMs - suspicionTime > THIRTY_MINUTES_MS) {
+          // ** 不正確定 **
+          console.log(`[heartbeat] Fraud confirmed for user ${uid}. Suspicion time exceeded 30 minutes.`);
+          
+          // ペナルティと通知
+          const pairingStatus = userSnap.data()?.pairingStatus || {};
           const partnerLineUserId = pairingStatus.partnerLineUserId;
           await userRef.update({
             'blockStatus.activatedAt': admin.firestore.FieldValue.serverTimestamp(),
+            'blockStatus.suspicionDetectedAt': null // 警告状態を解除
           });
           if (partnerLineUserId) {
             await client.pushMessage(partnerLineUserId, {
@@ -292,34 +286,53 @@ app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
               text: '【NoMoreBet 警告】\nパートナーのアプリで不正な操作（セーフモード利用の可能性）が検知されたため、連続ブロック期間がリセットされました。',
             });
           }
+          // 不正確定後、すべてのpingをクリア
+          const batch = dbx.batch();
+          pendingPingsQuery.docs.forEach((doc) => batch.delete(doc.ref));
+          await batch.commit();
+        } else {
+          // 30分以内なので、まだ警告状態を継続
+          console.log(`[heartbeat] User ${uid} is still under suspicion.`);
         }
-        
-        // 確認が終わったpingは必ず削除
-        const allPings = await userRef.collection('pendingPings').get();
-        const batch = dbx.batch();
-        allPings.docs.forEach((doc) => batch.delete(doc.ref));
-        await batch.commit();
+      } else {
+        // -- 2b: 今回初めて警告状態になる場合 --
+        console.log(`[heartbeat] Suspicion detected for user ${uid}. Setting warning timestamp.`);
+        await userRef.update({
+          'blockStatus.suspicionDetectedAt': admin.firestore.FieldValue.serverTimestamp()
+        });
       }
     }
-    // ▲▲▲ 新しい不正検知のロジックここまで ▲▲▲
-    
-    // 最後に、今回のハートビート時刻を正常に更新する
+
+    // 最後に、今回のハートビート時刻を更新
     await userRef.update({ 'blockStatus.lastHeartbeat': admin.firestore.FieldValue.serverTimestamp() });
     res.json({ ok: true });
+    
   } catch (e) {
     console.error(`[heartbeat] processing failed for user ${uid}`, e);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// ★ 5) ping の ACK
+// ★ 5) ping の ACK (警告解除ロジックを追加)
 app.post('/ack-ping', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   const pingId = req.body?.pingId;
   if (!pingId) return res.status(400).json({ error: 'pingId is required' });
   try {
-    const pingRef = getDb().collection('users').doc(uid).collection('pendingPings').doc(pingId);
+    const dbx = getDb();
+    const userRef = dbx.collection('users').doc(uid);
+    const pingRef = userRef.collection('pendingPings').doc(pingId);
+    
     await pingRef.delete();
+
+    // pingを削除した後、他に未処理のpingが残っていないか確認
+    const remainingPingsQuery = await userRef.collection('pendingPings').get();
+    if (remainingPingsQuery.empty) {
+      // もし残っていなければ、警告状態を解除する
+      await userRef.update({ 'blockStatus.suspicionDetectedAt': null });
+      console.log(`[ack-ping] All pings cleared for user ${uid}. Suspicion flag removed.`);
+    }
+
     res.json({ ok: true });
   } catch (e) {
     console.error('[ack-ping] failed', e);
