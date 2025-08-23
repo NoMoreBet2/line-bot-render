@@ -50,6 +50,7 @@ const app = express();
 
 app.get('/', (_, res) => res.send('LINE Bot is running!'));
 app.get('/healthz', (_, res) => res.send('healthy'));
+app.use(express.json());
 
 // ==============================
 // LINE 設定
@@ -86,8 +87,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     console.error('[webhook] error', e);
   }
 });
-
-app.use(express.json());
 
 // ==============================
 // ユーティリティ
@@ -231,7 +230,6 @@ app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) =>
     const pairingStatus = userSnap.data().pairingStatus || {};
     const partnerLineUserId = pairingStatus.partnerLineUserId;
     if (partnerLineUserId && pairingStatus.status === 'paired') {
-      // 注意：このAPIのメッセージは今回の変更とは直接関係ないため、必要に応じて別途修正してください。
       await client.pushMessage(partnerLineUserId, {
         type: 'text',
         text: '【NoMoreBet 警告】\nパートナーのアプリで、ブロック機能の不正な操作が検知されました。現在、ブロック機能は解除されています。',
@@ -244,43 +242,68 @@ app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) =>
   }
 });
 
-// ★ 4) ハートビート受信 & 不正最終判断
+// ★ 4) ハートビート受信 & 不正最終判断 (最終版ロジック)
 app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   try {
     const dbx = getDb();
     const userRef = dbx.collection('users').doc(uid);
-    const pendingPingsQuery = await userRef.collection('pendingPings').limit(1).get();
-    
-    if (!pendingPingsQuery.empty) {
-      const latestPing = pendingPingsQuery.docs[0].data();
-      const pingSentAt = latestPing.sentAt.toMillis();
-      const nowMs = Date.now();
-      const GRACE_PERIOD_MS = 30 * 1000;
-      
-      if (nowMs - pingSentAt < GRACE_PERIOD_MS) {
-        console.log(`[heartbeat] Ignored potential fraud for user ${uid} within grace period.`);
-      } else {
-        console.log(`[heartbeat] Fraud detected for user ${uid}. Heartbeat received while pings are pending.`);
-        const pairingStatus = (await userRef.get()).data()?.pairingStatus || {};
-        const partnerLineUserId = pairingStatus.partnerLineUserId;
-        await userRef.update({
-          'blockStatus.activatedAt': admin.firestore.FieldValue.serverTimestamp(),
-        });
-        if (partnerLineUserId) {
-          await client.pushMessage(partnerLineUserId, {
-            type: 'text',
-            text: '【NoMoreBet 警告】\nパートナーのアプリで不正な操作（セーフモード利用の可能性）が検知されたため、連続ブロック期間がリセットされました。',
-          });
-        }
-      }
+
+    // ▼▼▼ ここからが新しい不正検知のロジック ▼▼▼
+
+    // アプリから「再起動した」という証明書が送られてきたか確認
+    const wasRebooted = req.body?.rebooted === true;
+
+    if (wasRebooted) {
+      // --- ケース1: 再起動の証明書がある場合 ---
+      // 電源オフが理由であることが確定なので、無条件でセーフとする。
+      console.log(`[heartbeat] Received heartbeat with reboot flag for user ${uid}. Clearing all pending pings.`);
       
       const allPings = await userRef.collection('pendingPings').get();
-      const batch = dbx.batch();
-      allPings.docs.forEach((doc) => batch.delete(doc.ref));
-      await batch.commit();
+      if (!allPings.empty) {
+        const batch = dbx.batch();
+        allPings.docs.forEach((doc) => batch.delete(doc.ref));
+        await batch.commit();
+      }
+
+    } else {
+      // --- ケース2: 再起動の証明書がない場合（通常のチェック）---
+      const pendingPingsQuery = await userRef.collection('pendingPings').limit(1).get();
+      if (!pendingPingsQuery.empty) {
+        const latestPing = pendingPingsQuery.docs[0].data();
+        const pingSentAt = latestPing.sentAt.toMillis();
+        const nowMs = Date.now();
+        const GRACE_PERIOD_MS = 30 * 1000;
+        
+        if (nowMs - pingSentAt < GRACE_PERIOD_MS) {
+          // 猶予期間内なら、スリープ復帰とみなし不正ではない
+          console.log(`[heartbeat] Ignored potential fraud for user ${uid} within grace period.`);
+        } else {
+          // 猶予期間外なら、セーフモードなどの不正と確定
+          console.log(`[heartbeat] Fraud detected for user ${uid}. Heartbeat received while pings are pending.`);
+          const pairingStatus = (await userRef.get()).data()?.pairingStatus || {};
+          const partnerLineUserId = pairingStatus.partnerLineUserId;
+          await userRef.update({
+            'blockStatus.activatedAt': admin.firestore.FieldValue.serverTimestamp(),
+          });
+          if (partnerLineUserId) {
+            await client.pushMessage(partnerLineUserId, {
+              type: 'text',
+              text: '【NoMoreBet 警告】\nパートナーのアプリで不正な操作（セーフモード利用の可能性）が検知されたため、連続ブロック期間がリセットされました。',
+            });
+          }
+        }
+        
+        // 確認が終わったpingは必ず削除
+        const allPings = await userRef.collection('pendingPings').get();
+        const batch = dbx.batch();
+        allPings.docs.forEach((doc) => batch.delete(doc.ref));
+        await batch.commit();
+      }
     }
+    // ▲▲▲ 新しい不正検知のロジックここまで ▲▲▲
     
+    // 最後に、今回のハートビート時刻を正常に更新する
     await userRef.update({ 'blockStatus.lastHeartbeat': admin.firestore.FieldValue.serverTimestamp() });
     res.json({ ok: true });
   } catch (e) {
@@ -314,33 +337,24 @@ app.get('/cron/check-heartbeats', async (req, res) => {
   const dbx = getDb();
   const nowTs = admin.firestore.Timestamp.now();
 
-  // ▼▼▼ 修正点: 古い(48時間以上)pendingPingsを削除するゴミ掃除処理 ▼▼▼
+  // 48時間以上経過した古いpendingPingsを削除するゴミ掃除処理
   try {
     const cleanupCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - hours(48));
     const allUsers = await dbx.collection('users').get();
-    let cleanedCount = 0;
-
-    // ユーザーごとに非同期処理を待つように修正
     for (const userDoc of allUsers.docs) {
       const pingsToCleanQuery = await userDoc.ref.collection('pendingPings').where('sentAt', '<', cleanupCutoff).get();
       if (!pingsToCleanQuery.empty) {
         const batch = dbx.batch();
         pingsToCleanQuery.docs.forEach(doc => batch.delete(doc.ref));
-        await batch.commit(); // ユーザーごとにバッチをコミット
-        cleanedCount += pingsToCleanQuery.size;
+        await batch.commit();
         console.log(`[cron-cleanup] Cleaned ${pingsToCleanQuery.size} old pings for user ${userDoc.id}`);
       }
     }
-
-    if (cleanedCount > 0) {
-        console.log(`[cron-cleanup] Total old pings cleaned: ${cleanedCount}`);
-    }
   } catch (e) {
     console.error('[cron-cleanup] failed', e);
-    // This part is not critical, so we don't stop the main cron job.
   }
-  // ▲▲▲ ゴミ掃除処理ここまで ▲▲▲
 
+  // ハートビートが20分以上途絶えているユーザーを探す
   const staleCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - minutes(20));
   const longOfflineCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - minutes(24 * 60));
 
@@ -350,9 +364,6 @@ app.get('/cron/check-heartbeats', async (req, res) => {
       .where('blockStatus.lastHeartbeat', '<', staleCutoff)
       .where('blockStatus.lastHeartbeat', '>', longOfflineCutoff)
       .get();
-
-    const sent = [];
-    const skippedNoToken = [];
 
     console.log(
       '[cron] run at=%s | candidates=%d | stale<%s longOffline>%s',
@@ -364,10 +375,8 @@ app.get('/cron/check-heartbeats', async (req, res) => {
 
     for (const userDoc of q.docs) {
       const uid = userDoc.id;
-      const userData = userDoc.data();
-      const fcmToken = userData.deviceStatus?.fcmToken;
+      const fcmToken = userDoc.data().deviceStatus?.fcmToken;
       if (!fcmToken) {
-        skippedNoToken.push(uid);
         console.warn('[cron] skip (no fcmToken) -> %s', uid);
         continue;
       }
@@ -380,14 +389,12 @@ app.get('/cron/check-heartbeats', async (req, res) => {
           data: { action: 'ping_challenge', pingId },
           android: { priority: 'high' },
         });
-        sent.push(uid);
         console.log('[cron] ping queued -> %s (%s)', uid, pingId);
       } catch (sendErr) {
         console.error('[cron] FCM send error -> %s :', uid, sendErr);
       }
     }
-    console.log('[cron] done | sent=%d | skipped(noToken)=%d', sent.length, skippedNoToken.length);
-    return res.json({ ok: true, checked: q.size, sent, skippedNoToken });
+    return res.json({ ok: true, checked: q.size });
   } catch (e) {
     console.error('[cron] failed', e);
     return res.status(500).json({ error: 'Internal error' });
@@ -399,7 +406,7 @@ app.get('/cron/check-heartbeats', async (req, res) => {
 // ==============================
 (async () => {
   try {
-    await initAsync(); // ← 先に初期化を完了させてレース回避
+    await initAsync();
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`[boot] listening on ${PORT}`);
     });
