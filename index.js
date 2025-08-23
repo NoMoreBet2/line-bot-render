@@ -231,6 +231,7 @@ app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) =>
     const pairingStatus = userSnap.data().pairingStatus || {};
     const partnerLineUserId = pairingStatus.partnerLineUserId;
     if (partnerLineUserId && pairingStatus.status === 'paired') {
+      // 注意：このAPIのメッセージは今回の変更とは直接関係ないため、必要に応じて別途修正してください。
       await client.pushMessage(partnerLineUserId, {
         type: 'text',
         text: '【NoMoreBet 警告】\nパートナーのアプリで、ブロック機能の不正な操作が検知されました。現在、ブロック機能は解除されています。',
@@ -250,11 +251,13 @@ app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
     const dbx = getDb();
     const userRef = dbx.collection('users').doc(uid);
     const pendingPingsQuery = await userRef.collection('pendingPings').limit(1).get();
+    
     if (!pendingPingsQuery.empty) {
       const latestPing = pendingPingsQuery.docs[0].data();
       const pingSentAt = latestPing.sentAt.toMillis();
       const nowMs = Date.now();
       const GRACE_PERIOD_MS = 30 * 1000;
+      
       if (nowMs - pingSentAt < GRACE_PERIOD_MS) {
         console.log(`[heartbeat] Ignored potential fraud for user ${uid} within grace period.`);
       } else {
@@ -271,11 +274,13 @@ app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
           });
         }
       }
+      
       const allPings = await userRef.collection('pendingPings').get();
       const batch = dbx.batch();
       allPings.docs.forEach((doc) => batch.delete(doc.ref));
       await batch.commit();
     }
+    
     await userRef.update({ 'blockStatus.lastHeartbeat': admin.firestore.FieldValue.serverTimestamp() });
     res.json({ ok: true });
   } catch (e) {
