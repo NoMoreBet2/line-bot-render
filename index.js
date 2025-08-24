@@ -59,7 +59,7 @@ const firebaseAuthMiddleware = async (req, res, next) => {
   const idToken = authHeader.substring('Bearer '.length);
   try {
     const decoded = await admin.auth().verifyIdToken(idToken);
-    req.auth = { uid: decoded.uid };
+    req.auth = { uid: decoded.uid, email: decoded.email }; // ★ emailも取得するように変更
     next();
   } catch (error) {
     console.error('[auth] verifyIdToken error:', error);
@@ -197,16 +197,34 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
 });
 
 app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => {
+  // ★ ユーザーのemailとuidを認証ミドルウェアから受け取る
   const uid = req.auth.uid;
+  const email = req.auth.email;
+  const dbx = getDb();
+
   try {
-    const dbx = getDb();
-    const userSnap = await dbx.collection('users').doc(uid).get();
+    // ★ テスト用メールアドレスの場合の特別処理
+    if (email === "nomorebettest@gmail.com") {
+      const userRef = dbx.collection('users').doc(uid);
+      await userRef.update({
+        'blockStatus.isActive': false,
+        'blockStatus.activatedAt': null,
+      });
+      console.log(`[test-unlock] テスト用アカウントのブロックを自動解除しました: user=${uid}`);
+      return res.json({ ok: true, message: 'Auto-unlocked for test user.' });
+    }
+
+    // ★ 通常ユーザーの処理
+    const userRef = dbx.collection('users').doc(uid);
+    const userSnap = await userRef.get();
     if (!userSnap.exists) return res.status(404).json({ error: 'User not found' });
+    
     const pairingStatus = userSnap.data().pairingStatus || {};
     const partnerLineUserId = pairingStatus.partnerLineUserId;
     if (!partnerLineUserId || pairingStatus.status !== 'paired') {
       return res.status(400).json({ error: 'Partner is not configured.' });
     }
+    
     await client.pushMessage(partnerLineUserId, {
       type: 'template',
       altText: '解除申請が届きました',
@@ -220,11 +238,13 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
       },
     });
     res.json({ ok: true });
+
   } catch (e) {
     console.error('[request-partner-unlock] failed:', e);
     res.status(500).json({ error: 'Failed to process unlock request.' });
   }
 });
+
 
 // ▼▼▼ 強制解除の通知API ▼▼▼
 app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
@@ -234,7 +254,7 @@ app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
     const userSnap = await dbx.collection('users').doc(uid).get();
     if (!userSnap.exists) {
       // ユーザーが見つからない場合は何もしない
-      return res.status(404).json({ error: 'User not found' });
+      return res.status(4404).json({ error: 'User not found' });
     }
 
     const pairingStatus = userSnap.data().pairingStatus || {};
