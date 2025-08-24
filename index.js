@@ -101,6 +101,22 @@ function genCode(len = 6) {
 function reply(replyToken, text) {
   return client.replyMessage(replyToken, { type: 'text', text });
 }
+function pad2(n) { return String(n).padStart(2, '0'); }
+/** Firestore Timestamp -> 'yyyy-MM-dd-HH-mm' */
+function formatTs(ts) {
+  // ts: admin.firestore.Timestamp
+  const d = ts.toDate(); // JS Date (UTC→ローカルで可読化、表示目的なのでここでは簡易に)
+  const y = d.getFullYear();
+  const M = pad2(d.getMonth() + 1);
+  const D = pad2(d.getDate());
+  const H = pad2(d.getHours());
+  const m = pad2(d.getMinutes());
+  return `${y}-${M}-${D}-${H}-${m}`;
+}
+/** 短いID（衝突回避用のサフィックス） */
+function shortId(uuid) {
+  return uuid.replace(/-/g, '').slice(0, 6).toUpperCase();
+}
 
 // ==============================
 // メインイベントハンドラ (LINEからのWebhookイベント処理)
@@ -242,41 +258,44 @@ app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) =>
   }
 });
 
-// ★ 4) ハートビート受信 & 不正最終判断 (あなたの指示による最終ロジック)
+// ★ 4) ハートビート受信 & 不正最終判断
 app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   try {
     const dbx = getDb();
     const userRef = dbx.collection('users').doc(uid);
 
-    const pendingPingsQuery = await userRef.collection('pendingPings').get();
+    // 「未返信があるか」は status == 'waiting' のみで判定
+    const waitingPings = await userRef.collection('pendingPings')
+      .where('status', '==', 'waiting')
+      .get();
+
     const userSnap = await userRef.get();
     const blockStatus = userSnap.data()?.blockStatus || {};
 
-    if (pendingPingsQuery.empty) {
-      // --- ケース1: 未処理のpingがない場合（正常） ---
+    if (waitingPings.empty) {
+      // --- ケース1: 未返信なし（正常） ---
       if (blockStatus.suspicionDetectedAt) {
-        // もし警告状態だったら、正常に戻ったので警告を解除する
         await userRef.update({ 'blockStatus.suspicionDetectedAt': null });
         console.log(`[heartbeat] User ${uid} recovered from suspicion. Flag cleared.`);
       }
     } else {
-      // --- ケース2: 未処理のpingがある場合（警告または不正） ---
+      // --- ケース2: 未返信あり（疑い or 不正） ---
       if (blockStatus.suspicionDetectedAt) {
-        // -- 2a: すでに警告状態の場合 --
         const suspicionTime = blockStatus.suspicionDetectedAt.toMillis();
         const nowMs = Date.now();
         const THIRTY_MINUTES_MS = 30 * 60 * 1000;
 
         if (nowMs - suspicionTime > THIRTY_MINUTES_MS) {
-          // ** 不正確定 **
+          // ** 不正確定（削除はしない） **
           console.log(`[heartbeat] Fraud confirmed for user ${uid}. Suspicion time exceeded 30 minutes.`);
-          
+
           const pairingStatus = userSnap.data()?.pairingStatus || {};
           const partnerLineUserId = pairingStatus.partnerLineUserId;
           await userRef.update({
             'blockStatus.activatedAt': admin.firestore.FieldValue.serverTimestamp(),
-            'blockStatus.suspicionDetectedAt': null // 警告状態を解除
+            'blockStatus.suspicionDetectedAt': null,
+            'blockStatus.fraudConfirmedAt': admin.firestore.FieldValue.serverTimestamp()
           });
           if (partnerLineUserId) {
             await client.pushMessage(partnerLineUserId, {
@@ -284,16 +303,12 @@ app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
               text: '【NoMoreBet 警告】\nパートナーのアプリで不正な操作（セーフモード利用の可能性）が検知されたため、連続ブロック期間がリセットされました。',
             });
           }
-          // 不正確定後、すべてのpingをクリア
-          const batch = dbx.batch();
-          pendingPingsQuery.docs.forEach((doc) => batch.delete(doc.ref));
-          await batch.commit();
+          // ★ pendingPings は証跡として保持（削除しない）
         } else {
-          // 30分以内なので、まだ警告状態を継続
           console.log(`[heartbeat] User ${uid} is still under suspicion.`);
         }
       } else {
-        // -- 2b: 今回初めて警告状態になる場合 --
+        // 初回の疑い
         console.log(`[heartbeat] Suspicion detected for user ${uid}. Setting warning timestamp.`);
         await userRef.update({
           'blockStatus.suspicionDetectedAt': admin.firestore.FieldValue.serverTimestamp()
@@ -304,14 +319,14 @@ app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
     // 最後に、今回のハートビート時刻を更新
     await userRef.update({ 'blockStatus.lastHeartbeat': admin.firestore.FieldValue.serverTimestamp() });
     res.json({ ok: true });
-    
+
   } catch (e) {
     console.error(`[heartbeat] processing failed for user ${uid}`, e);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// ★ 5) ping の ACK (警告解除ロジックを追加)
+// ★ 5) ping の ACK（削除せず、status を 'replied' に更新）
 app.post('/ack-ping', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   const pingId = req.body?.pingId;
@@ -319,16 +334,33 @@ app.post('/ack-ping', firebaseAuthMiddleware, async (req, res) => {
   try {
     const dbx = getDb();
     const userRef = dbx.collection('users').doc(uid);
-    const pingRef = userRef.collection('pendingPings').doc(pingId);
-    
-    await pingRef.delete();
 
-    // pingを削除した後、他に未処理のpingが残っていないか確認
-    const remainingPingsQuery = await userRef.collection('pendingPings').get();
-    if (remainingPingsQuery.empty) {
-      // もし残っていなければ、警告状態を解除する
+    // 旧実装では doc(pingId) だったが、今は docId を時刻ベースにしたため検索して更新
+    const q = await userRef.collection('pendingPings')
+      .where('id', '==', pingId)
+      .limit(1)
+      .get();
+
+    if (q.empty) {
+      console.warn(`[ack-ping] ping not found for user ${uid}, pingId=${pingId}`);
+      return res.json({ ok: true, message: 'not found (already handled or cleaned)' });
+    }
+
+    const docRef = q.docs[0].ref;
+    await docRef.set({
+      status: 'replied',
+      repliedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    // まだ waiting が残っているかを確認
+    const remaining = await userRef.collection('pendingPings')
+      .where('status', '==', 'waiting')
+      .limit(1)
+      .get();
+
+    if (remaining.empty) {
       await userRef.update({ 'blockStatus.suspicionDetectedAt': null });
-      console.log(`[ack-ping] All pings cleared for user ${uid}. Suspicion flag removed.`);
+      console.log(`[ack-ping] All pings replied for user ${uid}. Suspicion flag removed.`);
     }
 
     res.json({ ok: true });
@@ -348,12 +380,15 @@ app.get('/cron/check-heartbeats', async (req, res) => {
   const dbx = getDb();
   const nowTs = admin.firestore.Timestamp.now();
 
-  // 48時間以上経過した古いpendingPingsを削除するゴミ掃除処理
+  // 48時間以上経過した古い pendingPings を削除するゴミ掃除処理（必要なら status 条件を追加可能）
   try {
     const cleanupCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - hours(48));
     const allUsers = await dbx.collection('users').get();
     for (const userDoc of allUsers.docs) {
-      const pingsToCleanQuery = await userDoc.ref.collection('pendingPings').where('sentAt', '<', cleanupCutoff).get();
+      const pingsToCleanQuery = await userDoc.ref
+        .collection('pendingPings')
+        .where('sentAt', '<', cleanupCutoff)
+        .get();
       if (!pingsToCleanQuery.empty) {
         const batch = dbx.batch();
         pingsToCleanQuery.docs.forEach(doc => batch.delete(doc.ref));
@@ -391,16 +426,28 @@ app.get('/cron/check-heartbeats', async (req, res) => {
         console.warn('[cron] skip (no fcmToken) -> %s', uid);
         continue;
       }
-      const pingId = crypto.randomUUID();
-      const pingRef = userDoc.ref.collection('pendingPings').doc(pingId);
-      await pingRef.set({ sentAt: nowTs, by: 'cron' });
+
+      // ping 識別用 UUID（payloadで端末に渡す ID）
+      const pingUuid = crypto.randomUUID();
+      const suffix = shortId(pingUuid);
+      const docId = `${formatTs(nowTs)}-${suffix}`; // 例: 2025-08-24-09-15-1A2B3C
+
+      const pingRef = userDoc.ref.collection('pendingPings').doc(docId);
+      await pingRef.set({
+        id: pingUuid,                 // ← 識別ID（ACKで使う）
+        status: 'waiting',            // ← 返信待ち
+        sentAt: nowTs,
+        by: 'cron',
+        readableId: docId             // （検索は id を使う。表示・監査用に残す）
+      });
+
       try {
         await admin.messaging().send({
           token: fcmToken,
-          data: { action: 'ping_challenge', pingId },
+          data: { action: 'ping_challenge', pingId: pingUuid },
           android: { priority: 'high' },
         });
-        console.log('[cron] ping queued -> %s (%s)', uid, pingId);
+        console.log('[cron] ping queued -> %s (%s / %s)', uid, pingUuid, docId);
       } catch (sendErr) {
         console.error('[cron] FCM send error -> %s :', uid, sendErr);
       }
