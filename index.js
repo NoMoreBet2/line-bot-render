@@ -5,9 +5,7 @@ const line = require('@line/bot-sdk');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
 
-// ==============================
-// 環境変数
-// ==============================
+// ===== Env =====
 const PORT = process.env.PORT || 3000;
 const CRON_SECRET = process.env.CRON_SECRET || '';
 const lineConfig = {
@@ -15,9 +13,14 @@ const lineConfig = {
   channelSecret: process.env.CHANNEL_SECRET,
 };
 
-// ==============================
-// Firebase Admin 初期化
-// ==============================
+// 運用パラメータ（環境変数で上書き可）
+const STALE_MINUTES = Number(process.env.STALE_MINUTES || 20);            // HBが来なければ ping 対象（分）
+const LONG_OFFLINE_MIN = Number(process.env.LONG_OFFLINE_MIN || 1440);    // 長期離脱の上限（分）
+const PING_TTL_MS = Number(process.env.PING_TTL_MS || (2 * 60 * 1000));   // FCM TTL
+const PING_ACK_WINDOW_MS = Number(process.env.PING_ACK_WINDOW_MS || PING_TTL_MS); // 返信猶予
+const FCM_FAIL_THRESHOLD = Number(process.env.FCM_FAIL_THRESHOLD || 3);   // 連続失敗しきい値
+
+// ===== Firebase Admin =====
 let db = null;
 async function initAsync() {
   if (admin.apps.length) {
@@ -25,41 +28,29 @@ async function initAsync() {
     return;
   }
   const sa = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  try {
-    if (sa) {
-      admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
-    } else {
-      admin.initializeApp();
-    }
-    db = admin.firestore();
-    console.log('[init] Firestore handle obtained');
-  } catch (e) {
-    console.error('[init] Firebase init failed:', e);
-    throw e;
+  if (sa) {
+    admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
+  } else {
+    admin.initializeApp();
   }
+  db = admin.firestore();
+  console.log('[init] Firestore handle obtained');
 }
 const getDb = () => {
   if (!db) throw new Error('Firestore not initialized yet');
   return db;
 };
 
-// ==============================
-// Express 準備
-// ==============================
+// ===== Express =====
 const app = express();
-
 app.get('/', (_, res) => res.send('LINE Bot is running!'));
 app.get('/healthz', (_, res) => res.send('healthy'));
 app.use(express.json());
 
-// ==============================
-// LINE 設定
-// ==============================
+// ===== LINE =====
 const client = new line.Client(lineConfig);
 
-// ==============================
-// Firebase 認証ミドルウェア
-// ==============================
+// ===== Firebase Auth MW =====
 const firebaseAuthMiddleware = async (req, res, next) => {
   const authHeader = req.headers.authorization || '';
   if (!authHeader.startsWith('Bearer ')) {
@@ -71,14 +62,41 @@ const firebaseAuthMiddleware = async (req, res, next) => {
     req.auth = { uid: decoded.uid };
     next();
   } catch (error) {
-    console.error('[auth] Error verifying token:', error);
+    console.error('[auth] verifyIdToken error:', error);
     return res.status(403).json({ error: 'Unauthorized: Invalid token' });
   }
 };
 
-// ==============================
-// Webhook
-// ==============================
+// ===== Utils =====
+const now = () => Date.now();
+const minutes = (n) => n * 60 * 1000;
+const hours = (n) => n * 60 * 60 * 1000;
+const pad2 = (n) => String(n).padStart(2, '0');
+
+function formatTs(ts) {
+  const d = ts.toDate();
+  const y = d.getFullYear();
+  const M = pad2(d.getMonth() + 1);
+  const D = pad2(d.getDate());
+  const H = pad2(d.getHours());
+  const m = pad2(d.getMinutes());
+  return `${y}-${M}-${D}-${H}-${m}`;
+}
+function shortId(uuid) {
+  return uuid.replace(/-/g, '').slice(0, 6).toUpperCase();
+}
+function makeDocId(ts, uuid) {
+  return `${formatTs(ts)}-${shortId(uuid)}`;
+}
+function genCode(len = 6) {
+  const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  return Array.from({ length: len }, () => ALPHABET[Math.floor(Math.random() * ALPHABET.length)]).join('');
+}
+function reply(replyToken, text) {
+  return client.replyMessage(replyToken, { type: 'text', text });
+}
+
+// ===== LINE webhook =====
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   res.sendStatus(200);
   try {
@@ -88,39 +106,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   }
 });
 
-// ==============================
-// ユーティリティ
-// ==============================
-const now = () => Date.now();
-const minutes = (n) => n * 60 * 1000;
-const hours = (n) => n * 60 * 60 * 1000;
-const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-function genCode(len = 6) {
-  return Array.from({ length: len }, () => ALPHABET[Math.floor(Math.random() * ALPHABET.length)]).join('');
-}
-function reply(replyToken, text) {
-  return client.replyMessage(replyToken, { type: 'text', text });
-}
-function pad2(n) { return String(n).padStart(2, '0'); }
-/** Firestore Timestamp -> 'yyyy-MM-dd-HH-mm' */
-function formatTs(ts) {
-  // ts: admin.firestore.Timestamp
-  const d = ts.toDate(); // JS Date (UTC→ローカルで可読化、表示目的なのでここでは簡易に)
-  const y = d.getFullYear();
-  const M = pad2(d.getMonth() + 1);
-  const D = pad2(d.getDate());
-  const H = pad2(d.getHours());
-  const m = pad2(d.getMinutes());
-  return `${y}-${M}-${D}-${H}-${m}`;
-}
-/** 短いID（衝突回避用のサフィックス） */
-function shortId(uuid) {
-  return uuid.replace(/-/g, '').slice(0, 6).toUpperCase();
-}
-
-// ==============================
-// メインイベントハンドラ (LINEからのWebhookイベント処理)
-// ==============================
 async function handleEvent(event) {
   if (event.type === 'message' && event.message?.type === 'text') {
     const text = (event.message.text || '').trim();
@@ -181,9 +166,7 @@ async function handleEvent(event) {
   }
 }
 
-// ==============================
-// 自前 API (Androidアプリからのリクエスト処理)
-// ==============================
+// ===== App APIs =====
 app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
   const appUserUid = req.auth.uid;
   const code = genCode(6).toUpperCase();
@@ -237,96 +220,20 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
   }
 });
 
-app.post('/notify-partner-of-fraud', firebaseAuthMiddleware, async (req, res) => {
-  const uid = req.auth.uid;
-  try {
-    const dbx = getDb();
-    const userSnap = await dbx.collection('users').doc(uid).get();
-    if (!userSnap.exists) return res.status(404).json({ error: 'User not found' });
-    const pairingStatus = userSnap.data().pairingStatus || {};
-    const partnerLineUserId = pairingStatus.partnerLineUserId;
-    if (partnerLineUserId && pairingStatus.status === 'paired') {
-      await client.pushMessage(partnerLineUserId, {
-        type: 'text',
-        text: '【NoMoreBet 警告】\nパートナーのアプリで不正な操作（セーフモード利用の可能性）が検知されたため、連続ブロック期間がリセットされました。',
-      });
-    }
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[notify-partner-of-fraud] failed:', e);
-    res.status(500).json({ error: 'Failed to notify partner.' });
-  }
-});
-
-// ★ 4) ハートビート受信 & 不正最終判断
+// Heartbeat: lastHeartbeat のみ更新
 app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   try {
-    const dbx = getDb();
-    const userRef = dbx.collection('users').doc(uid);
-
-    // 「未返信があるか」は status == 'waiting' のみで判定
-    const waitingPings = await userRef.collection('pendingPings')
-      .where('status', '==', 'waiting')
-      .get();
-
-    const userSnap = await userRef.get();
-    const blockStatus = userSnap.data()?.blockStatus || {};
-
-    if (waitingPings.empty) {
-      // --- ケース1: 未返信なし（正常） ---
-      if (blockStatus.suspicionDetectedAt) {
-        await userRef.update({ 'blockStatus.suspicionDetectedAt': null });
-        console.log(`[heartbeat] User ${uid} recovered from suspicion. Flag cleared.`);
-      }
-    } else {
-      // --- ケース2: 未返信あり（疑い or 不正） ---
-      if (blockStatus.suspicionDetectedAt) {
-        const suspicionTime = blockStatus.suspicionDetectedAt.toMillis();
-        const nowMs = Date.now();
-        const THIRTY_MINUTES_MS = 30 * 60 * 1000;
-
-        if (nowMs - suspicionTime > THIRTY_MINUTES_MS) {
-          // ** 不正確定（削除はしない） **
-          console.log(`[heartbeat] Fraud confirmed for user ${uid}. Suspicion time exceeded 30 minutes.`);
-
-          const pairingStatus = userSnap.data()?.pairingStatus || {};
-          const partnerLineUserId = pairingStatus.partnerLineUserId;
-          await userRef.update({
-            'blockStatus.activatedAt': admin.firestore.FieldValue.serverTimestamp(),
-            'blockStatus.suspicionDetectedAt': null,
-            'blockStatus.fraudConfirmedAt': admin.firestore.FieldValue.serverTimestamp()
-          });
-          if (partnerLineUserId) {
-            await client.pushMessage(partnerLineUserId, {
-              type: 'text',
-              text: '【NoMoreBet 警告】\nパートナーのアプリで不正な操作（セーフモード利用の可能性）が検知されたため、連続ブロック期間がリセットされました。',
-            });
-          }
-          // ★ pendingPings は証跡として保持（削除しない）
-        } else {
-          console.log(`[heartbeat] User ${uid} is still under suspicion.`);
-        }
-      } else {
-        // 初回の疑い
-        console.log(`[heartbeat] Suspicion detected for user ${uid}. Setting warning timestamp.`);
-        await userRef.update({
-          'blockStatus.suspicionDetectedAt': admin.firestore.FieldValue.serverTimestamp()
-        });
-      }
-    }
-
-    // 最後に、今回のハートビート時刻を更新
+    const userRef = getDb().collection('users').doc(uid);
     await userRef.update({ 'blockStatus.lastHeartbeat': admin.firestore.FieldValue.serverTimestamp() });
     res.json({ ok: true });
-
   } catch (e) {
-    console.error(`[heartbeat] processing failed for user ${uid}`, e);
+    console.error(`[heartbeat] failed for user ${uid}`, e);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// ★ 5) ping の ACK（削除せず、status を 'replied' に更新）
+// ACK: waiting→replied（期限超過は replied_late）
 app.post('/ack-ping', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   const pingId = req.body?.pingId;
@@ -334,35 +241,22 @@ app.post('/ack-ping', firebaseAuthMiddleware, async (req, res) => {
   try {
     const dbx = getDb();
     const userRef = dbx.collection('users').doc(uid);
-
-    // 旧実装では doc(pingId) だったが、今は docId を時刻ベースにしたため検索して更新
-    const q = await userRef.collection('pendingPings')
-      .where('id', '==', pingId)
-      .limit(1)
-      .get();
-
+    const q = await userRef.collection('pendingPings').where('id', '==', pingId).limit(1).get();
     if (q.empty) {
       console.warn(`[ack-ping] ping not found for user ${uid}, pingId=${pingId}`);
-      return res.json({ ok: true, message: 'not found (already handled or cleaned)' });
+      return res.json({ ok: true, message: 'not found' });
     }
-
-    const docRef = q.docs[0].ref;
-    await docRef.set({
-      status: 'replied',
+    const snap = q.docs[0];
+    const data = snap.data();
+    if (data.status !== 'waiting') {
+      return res.json({ ok: true, message: `ignored (${data.status})` });
+    }
+    const deadlineMs = (data.expiresAt?.toMillis?.() ?? (data.sentAt?.toMillis?.() + PING_ACK_WINDOW_MS));
+    const newStatus = (Date.now() <= deadlineMs) ? 'replied' : 'replied_late';
+    await snap.ref.set({
+      status: newStatus,
       repliedAt: admin.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
-
-    // まだ waiting が残っているかを確認
-    const remaining = await userRef.collection('pendingPings')
-      .where('status', '==', 'waiting')
-      .limit(1)
-      .get();
-
-    if (remaining.empty) {
-      await userRef.update({ 'blockStatus.suspicionDetectedAt': null });
-      console.log(`[ack-ping] All pings replied for user ${uid}. Suspicion flag removed.`);
-    }
-
     res.json({ ok: true });
   } catch (e) {
     console.error(`[ack-ping] failed for user ${uid}, pingId: ${pingId}`, e);
@@ -370,7 +264,7 @@ app.post('/ack-ping', firebaseAuthMiddleware, async (req, res) => {
   }
 });
 
-// ★ 6) 定期実行：ハートビート監視 Cron
+// ===== Cron：1) 期限切れ回収→通知 2) 未HBユーザーへ ping 3) 古いログ掃除 =====
 app.get('/cron/check-heartbeats', async (req, res) => {
   if (!CRON_SECRET || req.query.secret !== CRON_SECRET) {
     console.warn('[cron] 403 secret mismatch');
@@ -379,32 +273,50 @@ app.get('/cron/check-heartbeats', async (req, res) => {
 
   const dbx = getDb();
   const nowTs = admin.firestore.Timestamp.now();
+  const staleCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - minutes(STALE_MINUTES));
+  const longOfflineCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - minutes(LONG_OFFLINE_MIN));
 
-  // 48時間以上経過した古い pendingPings を削除するゴミ掃除処理（必要なら status 条件を追加可能）
   try {
-    const cleanupCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - hours(48));
+    // 1) 期限切れ waiting → expired & パートナー通知
     const allUsers = await dbx.collection('users').get();
     for (const userDoc of allUsers.docs) {
-      const pingsToCleanQuery = await userDoc.ref
-        .collection('pendingPings')
-        .where('sentAt', '<', cleanupCutoff)
+      const userRef = userDoc.ref;
+      const pairingStatus = userDoc.data()?.pairingStatus || {};
+      const partnerLineUserId = pairingStatus.partnerLineUserId;
+
+      const overdue = await userRef.collection('pendingPings')
+        .where('status', '==', 'waiting')
+        .where('expiresAt', '<', nowTs)
         .get();
-      if (!pingsToCleanQuery.empty) {
+
+      if (!overdue.empty) {
         const batch = dbx.batch();
-        pingsToCleanQuery.docs.forEach(doc => batch.delete(doc.ref));
+        for (const ping of overdue.docs) {
+          batch.set(ping.ref, { status: 'expired', expiredAt: nowTs }, { merge: true });
+
+          if (partnerLineUserId) {
+            const readableId = ping.data().readableId || '(no-id)';
+            const sentAt = ping.data().sentAt;
+            const sentStr = sentAt ? new Date(sentAt.toMillis()).toLocaleString('ja-JP') : '不明';
+            try {
+              await client.pushMessage(partnerLineUserId, {
+                type: 'text',
+                text:
+                  `【NoMoreBet お知らせ】\n` +
+                  `確認用の通知に応答がありませんでした（ID: ${readableId} / 送信: ${sentStr}）。\n` +
+                  `端末の電源OFF・セーフモード・圏外・端末設定などの可能性があります。`
+              });
+            } catch (e) {
+              console.error('[cron] LINE push error:', e);
+            }
+          }
+        }
         await batch.commit();
-        console.log(`[cron-cleanup] Cleaned ${pingsToCleanQuery.size} old pings for user ${userDoc.id}`);
+        console.log(`[cron] expired marked: user=${userDoc.id}, count=${overdue.size}`);
       }
     }
-  } catch (e) {
-    console.error('[cron-cleanup] failed', e);
-  }
 
-  // ハートビートが20分以上途絶えているユーザーを探す
-  const staleCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - minutes(20));
-  const longOfflineCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - minutes(24 * 60));
-
-  try {
+    // 2) HBが途絶えたユーザーに ping 送信（既に waiting があればスキップ）
     const q = await dbx.collection('users')
       .where('blockStatus.isActive', '==', true)
       .where('blockStatus.lastHeartbeat', '<', staleCutoff)
@@ -412,7 +324,7 @@ app.get('/cron/check-heartbeats', async (req, res) => {
       .get();
 
     console.log(
-      '[cron] run at=%s | candidates=%d | stale<%s longOffline>%s',
+      '[cron] run at=%s | stale candidates=%d | stale<%s longOffline>%s',
       new Date().toISOString(),
       q.size,
       new Date(staleCutoff.toMillis()).toISOString(),
@@ -421,47 +333,128 @@ app.get('/cron/check-heartbeats', async (req, res) => {
 
     for (const userDoc of q.docs) {
       const uid = userDoc.id;
+      const userRef = userDoc.ref;
       const fcmToken = userDoc.data().deviceStatus?.fcmToken;
       if (!fcmToken) {
         console.warn('[cron] skip (no fcmToken) -> %s', uid);
         continue;
       }
 
-      // ping 識別用 UUID（payloadで端末に渡す ID）
-      const pingUuid = crypto.randomUUID();
-      const suffix = shortId(pingUuid);
-      const docId = `${formatTs(nowTs)}-${suffix}`; // 例: 2025-08-24-09-15-1A2B3C
+      const waitingExists = await userRef.collection('pendingPings')
+        .where('status', '==', 'waiting')
+        .limit(1)
+        .get();
+      if (!waitingExists.empty) {
+        console.log('[cron] skip (waiting exists) -> %s', uid);
+        continue;
+      }
 
-      const pingRef = userDoc.ref.collection('pendingPings').doc(docId);
-      await pingRef.set({
-        id: pingUuid,                 // ← 識別ID（ACKで使う）
-        status: 'waiting',            // ← 返信待ち
+      const pingUuid = crypto.randomUUID();
+      const docId = makeDocId(nowTs, pingUuid);
+      const expiresAt = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() + PING_ACK_WINDOW_MS);
+
+      await userRef.collection('pendingPings').doc(docId).set({
+        id: pingUuid,
+        readableId: docId,
+        status: 'waiting',
         sentAt: nowTs,
-        by: 'cron',
-        readableId: docId             // （検索は id を使う。表示・監査用に残す）
+        expiresAt,
+        by: 'cron'
       });
 
       try {
         await admin.messaging().send({
           token: fcmToken,
           data: { action: 'ping_challenge', pingId: pingUuid },
-          android: { priority: 'high' },
+          android: { priority: 'high', ttl: PING_TTL_MS },
         });
+
+        // 送信成功：連続失敗をリセット
+        await userRef.set({
+          deviceStatus: {
+            lastFcmOkAt: admin.firestore.FieldValue.serverTimestamp(),
+            fcmConsecutiveFails: 0,
+            gmsIssueSuspected: false
+          }
+        }, { merge: true });
+
         console.log('[cron] ping queued -> %s (%s / %s)', uid, pingUuid, docId);
       } catch (sendErr) {
-        console.error('[cron] FCM send error -> %s :', uid, sendErr);
+        const code = sendErr?.errorInfo?.code || sendErr?.code || 'unknown';
+        console.error('[cron] FCM send error -> %s : %s', uid, code, sendErr?.message);
+
+        // ログ保存（任意）
+        try {
+          await userRef.collection('fcmSendLogs').add({
+            token: fcmToken,
+            code,
+            message: sendErr?.message || '',
+            at: admin.firestore.FieldValue.serverTimestamp()
+          });
+        } catch (logErr) {
+          console.error('[cron] fcmSendLogs add error:', logErr);
+        }
+
+        // 失敗コード別の処理
+        if (code === 'messaging/registration-token-not-registered') {
+          // 失効したトークンを無効化
+          await userRef.set({
+            deviceStatus: {
+              fcmToken: admin.firestore.FieldValue.delete(),
+              fcmConsecutiveFails: admin.firestore.FieldValue.increment(1),
+              gmsIssueSuspected: false
+            }
+          }, { merge: true });
+        } else {
+          // 一時障害 or 不明 → 連続失敗カウントを進める
+          await userRef.set({
+            deviceStatus: {
+              fcmConsecutiveFails: admin.firestore.FieldValue.increment(1)
+            }
+          }, { merge: true });
+        }
+
+        // 連続失敗がしきい値を超えたら、GMS不整合の可能性をフラグで示す
+        try {
+          const fresh = await userRef.get();
+          const dev = fresh.data()?.deviceStatus || {};
+          if ((dev.fcmConsecutiveFails || 0) >= FCM_FAIL_THRESHOLD) {
+            await userRef.set({
+              deviceStatus: {
+                gmsIssueSuspected: true
+              }
+            }, { merge: true });
+          }
+        } catch (readErr) {
+          console.error('[cron] read-after-fail error:', readErr);
+        }
       }
     }
-    return res.json({ ok: true, checked: q.size });
+
+    // 3) 古い ping の掃除（48h）
+    try {
+      const cleanupCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - hours(48));
+      for (const userDoc of allUsers.docs) {
+        const old = await userDoc.ref.collection('pendingPings').where('sentAt', '<', cleanupCutoff).get();
+        if (!old.empty) {
+          const batch = dbx.batch();
+          old.docs.forEach(doc => batch.delete(doc.ref));
+          await batch.commit();
+          console.log(`[cron-cleanup] cleaned old pings: user=${userDoc.id}, count=${old.size}`);
+        }
+      }
+    } catch (e) {
+      console.error('[cron-cleanup] failed', e);
+    }
+
+    return res.json({ ok: true, staleChecked: q.size });
   } catch (e) {
     console.error('[cron] failed', e);
     return res.status(500).json({ error: 'Internal error' });
   }
 });
 
-// ==============================
-// サーバー起動（初期化を待ってから listen）
-// ==============================
+// ===== Boot =====
 (async () => {
   try {
     await initAsync();
