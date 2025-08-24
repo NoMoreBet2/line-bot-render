@@ -220,6 +220,37 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
   }
 });
 
+// ▼▼▼ 強制解除の通知API ▼▼▼
+app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
+  const uid = req.auth.uid;
+  try {
+    const dbx = getDb();
+    const userSnap = await dbx.collection('users').doc(uid).get();
+    if (!userSnap.exists) {
+      // ユーザーが見つからない場合は何もしない
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const pairingStatus = userSnap.data().pairingStatus || {};
+    const partnerLineUserId = pairingStatus.partnerLineUserId;
+
+    // パートナーが設定されていれば、LINEで通知を送信
+    if (partnerLineUserId && pairingStatus.status === 'paired') {
+      await client.pushMessage(partnerLineUserId, {
+        type: 'text',
+        text: '【NoMoreBet お知らせ】\nパートナーが強制解除機能を使用しました。'
+      });
+      console.log(`[force-unlock] 通知を送信しました: user=${uid}, partner=${partnerLineUserId}`);
+    }
+    
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(`[force-unlock-notify] failed for user ${uid}:`, e);
+    res.status(500).json({ error: 'Failed to send notification.' });
+  }
+});
+// ▲▲▲ ここまで ▲▲▲
+
 // Heartbeat: lastHeartbeat のみ更新
 app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
