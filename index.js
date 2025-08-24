@@ -45,7 +45,7 @@ const getDb = () => {
 const app = express();
 app.get('/', (_, res) => res.send('LINE Bot is running!'));
 app.get('/healthz', (_, res) => res.send('healthy'));
-app.use(express.json());
+// ★ express.json() はWebhookの後で読み込むので、ここでは削除
 
 // ===== LINE =====
 const client = new line.Client(lineConfig);
@@ -97,6 +97,7 @@ function reply(replyToken, text) {
 }
 
 // ===== LINE webhook =====
+// express.json()より先に定義して、生のbodyをLINEミドルウェアが検証できるようにする
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   res.sendStatus(200);
   try {
@@ -105,6 +106,11 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     console.error('[webhook] error', e);
   }
 });
+
+// ★ 修正点：express.json() をここに移動
+// これ以降のAPIルートでは、JSONボディが自動的にオブジェクトにパースされる
+app.use(express.json());
+
 
 async function handleEvent(event) {
   if (event.type === 'message' && event.message?.type === 'text') {
