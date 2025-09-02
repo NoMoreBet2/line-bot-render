@@ -209,20 +209,21 @@ async function handleEvent(event) {
 // ===== App APIs =====
 app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
   const appUserUid = req.auth.uid;
-  const code = genCode(5); // ← 5桁の数字
+  const code = genCode(5); // 5桁の数字を生成
   const expiresAt = now() + minutes(30);
   try {
     const dbx = getDb();
-    const batch = dbx.batch();
-    const codeRef = dbx.collection('codes').doc(code);
-    batch.set(codeRef, { appUserUid, expiresAt: admin.firestore.Timestamp.fromMillis(expiresAt) });
+    
+    // ▼▼▼ この部分を修正 ▼▼▼
+    // batch処理は不要。usersコレクションに直接書き込む
     const userRef = dbx.collection('users').doc(appUserUid);
-    batch.update(userRef, {
+    await userRef.update({
       'pairingStatus.code': code,
       'pairingStatus.expiresAt': admin.firestore.Timestamp.fromMillis(expiresAt),
       'pairingStatus.status': 'waiting',
     });
-    await batch.commit();
+    // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
     res.json({ code, expiresAt });
   } catch (e) {
     console.error('[pair/create] failed:', e);
