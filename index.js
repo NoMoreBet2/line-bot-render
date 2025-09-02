@@ -112,65 +112,97 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 app.use(express.json());
 
 
+// ▼▼▼ この handleEvent 関数を修正します ▼▼▼
 async function handleEvent(event) {
-  if (event.type === 'message' && event.message?.type === 'text') {
-    const text = (event.message.text || '').trim();
-    const m = /^pair\s+([A-Z0-9]{4,10})$/i.exec(text);
-    if (m && event.source?.userId) {
-      const code = m[1].toUpperCase();
-      const partnerLineUserId = event.source.userId;
-      try {
-        const dbx = getDb();
-        const codeRef = dbx.collection('codes').doc(code);
-        const codeSnap = await codeRef.get();
-        if (!codeSnap.exists || (codeSnap.data().expiresAt.toMillis?.() || 0) < now()) {
-          return reply(event.replyToken, `コード ${code} は無効か、有効期限切れです。`);
+    // --- 1. メッセージイベントの処理 ---
+    if (event.type === 'message' && event.message?.type === 'text' && event.source?.userId) {
+        const text = (event.message.text || '').trim();
+        const partnerLineUserId = event.source.userId;
+        let pairingCode = null;
+
+        // --- 修正点：まず「5桁の数字か？」をチェック ---
+        if (/^\d{5}$/.test(text)) {
+            pairingCode = text;
+        } 
+        // --- 従来の "pair XXXXX" 形式もチェック ---
+        else {
+            const match = /^pair\s+([A-Z0-9]{5,10})$/i.exec(text);
+            if (match) {
+                pairingCode = match[1].toUpperCase();
+            }
         }
-        const appUserUid = codeSnap.data().appUserUid;
-        const userRef = dbx.collection('users').doc(appUserUid);
-        const partnerProfile = await client.getProfile(partnerLineUserId);
-        await userRef.update({
-          'pairingStatus.status': 'paired',
-          'pairingStatus.partnerLineUserId': partnerLineUserId,
-          'pairingStatus.partnerDisplayName': partnerProfile.displayName,
-          'pairingStatus.pairedAt': admin.firestore.FieldValue.serverTimestamp(),
-        });
-        await codeRef.delete();
-        return reply(event.replyToken, `ペアリングが完了しました ✅`);
-      } catch (error) {
-        console.error('[webhook/pair] error', error);
-        return reply(event.replyToken, 'エラーが発生しました。');
-      }
-    }
-  }
-  if (event.type === 'postback') {
-    const data = event.postback?.data || '';
-    const ap = /^approve:(.+)$/i.exec(data);
-    const rj = /^reject:(.+)$/i.exec(data);
-    if (ap) {
-      const appUserUid = ap[1];
-      try {
-        const userRef = getDb().collection('users').doc(appUserUid);
-        await userRef.update({
-          'blockStatus.isActive': false,
-          'blockStatus.activatedAt': null,
-        });
-        if (event.source?.userId) {
-          await client.pushMessage(event.source.userId, { type: 'text', text: '承認しました。' });
+
+        // ペアリングコードが見つかった場合の共通処理
+        if (pairingCode) {
+            try {
+                const dbx = getDb();
+                // usersコレクションからpairingStatus.codeで検索
+                const usersQuery = await dbx.collection('users')
+                    .where('pairingStatus.code', '==', pairingCode)
+                    .limit(1)
+                    .get();
+
+                if (usersQuery.empty) {
+                    return reply(event.replyToken, `コード ${pairingCode} は無効です。`);
+                }
+                
+                const userDoc = usersQuery.docs[0];
+                const pairingStatus = userDoc.data().pairingStatus || {};
+                const expiresAt = pairingStatus.expiresAt;
+
+                if (!expiresAt || expiresAt.toMillis() < Date.now()) {
+                    return reply(event.replyToken, `コード ${pairingCode} は有効期限切れです。`);
+                }
+
+                const partnerProfile = await client.getProfile(partnerLineUserId);
+                await userDoc.ref.update({
+                    'pairingStatus.status': 'paired',
+                    'pairingStatus.partnerLineUserId': partnerLineUserId,
+                    'pairingStatus.partnerDisplayName': partnerProfile.displayName,
+                    'pairingStatus.pairedAt': admin.firestore.FieldValue.serverTimestamp(),
+                });
+
+                // codesコレクションはもう使わないので、削除処理は不要
+
+                return reply(event.replyToken, `ペアリングが完了しました ✅`);
+
+            } catch (error) {
+                console.error('[webhook/pair] error', error);
+                return reply(event.replyToken, 'エラーが発生しました。');
+            }
         }
-      } catch (err) {
-        console.error('[webhook/approve] failed:', err);
-      }
-      return;
     }
-    if (rj) {
-      if (event.source?.userId) {
-        await client.pushMessage(event.source.userId, { type: 'text', text: '解除申請を拒否しました。' });
-      }
-      return;
+
+    // --- 2. ポストバックイベントの処理 (変更なし) ---
+    if (event.type === 'postback') {
+        const data = event.postback?.data || '';
+        const ap = /^approve:(.+)$/i.exec(data);
+        const rj = /^reject:(.+)$/i.exec(data);
+        if (ap) {
+            const appUserUid = ap[1];
+            try {
+                const userRef = getDb().collection('users').doc(appUserUid);
+                await userRef.update({
+                    'blockStatus.isActive': false,
+                    'blockStatus.activatedAt': null,
+                });
+                if (event.source?.userId) {
+                    await client.pushMessage(event.source.userId, { type: 'text', text: '承認しました。' });
+                }
+            } catch (err) {
+                console.error('[webhook/approve] failed:', err);
+            }
+            return;
+        }
+        if (rj) {
+            if (event.source?.userId) {
+                await client.pushMessage(event.source.userId, { type: 'text', text: '解除申請を拒否しました。' });
+            }
+            return;
+        }
     }
-  }
 }
+
 
 // ===== App APIs =====
 app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
