@@ -116,29 +116,23 @@ app.use(express.json());
 
 // ▼▼▼ この handleEvent 関数を修正します ▼▼▼
 async function handleEvent(event) {
-    // --- 1. メッセージイベントの処理 ---
-    if (event.type === 'message' && event.message?.type === 'text' && event.source?.userId) {
+  if (event.type === 'message' && event.message?.type === 'text' && event.source?.userId) {
         const text = (event.message.text || '').trim();
         const partnerLineUserId = event.source.userId;
         let pairingCode = null;
 
-        // --- 修正点：まず「5桁の数字か？」をチェック ---
         if (/^\d{5}$/.test(text)) {
             pairingCode = text;
-        } 
-        // --- 従来の "pair XXXXX" 形式もチェック ---
-        else {
+        } else {
             const match = /^pair\s+([A-Z0-9]{5,10})$/i.exec(text);
             if (match) {
                 pairingCode = match[1].toUpperCase();
             }
         }
 
-        // ペアリングコードが見つかった場合の共通処理
         if (pairingCode) {
             try {
                 const dbx = getDb();
-                // usersコレクションからpairingStatus.codeで検索
                 const usersQuery = await dbx.collection('users')
                     .where('pairingStatus.code', '==', pairingCode)
                     .limit(1)
@@ -150,11 +144,23 @@ async function handleEvent(event) {
                 
                 const userDoc = usersQuery.docs[0];
                 const pairingStatus = userDoc.data().pairingStatus || {};
+                
+                // --- ▼▼▼ ここが最重要の修正点 ▼▼▼ ---
                 const expiresAt = pairingStatus.expiresAt;
+                let expiresAtMillis = 0;
 
-                if (!expiresAt || expiresAt.toMillis() < Date.now()) {
+                if (expiresAt && typeof expiresAt.toMillis === 'function') {
+                    // FirestoreのTimestamp型の場合
+                    expiresAtMillis = expiresAt.toMillis();
+                } else if (typeof expiresAt === 'number') {
+                    // ただの数値（エポックミリ秒）の場合
+                    expiresAtMillis = expiresAt;
+                }
+                
+                if (!expiresAt || expiresAtMillis < Date.now()) {
                     return reply(event.replyToken, `コード ${pairingCode} は有効期限切れです。`);
                 }
+                // --- ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲ ---
 
                 const partnerProfile = await client.getProfile(partnerLineUserId);
                 await userDoc.ref.update({
@@ -163,8 +169,6 @@ async function handleEvent(event) {
                     'pairingStatus.partnerDisplayName': partnerProfile.displayName,
                     'pairingStatus.pairedAt': admin.firestore.FieldValue.serverTimestamp(),
                 });
-
-                // codesコレクションはもう使わないので、削除処理は不要
 
                 return reply(event.replyToken, `ペアリングが完了しました ✅`);
 
@@ -208,27 +212,23 @@ async function handleEvent(event) {
 
 // ===== App APIs =====
 app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
-  const appUserUid = req.auth.uid;
-  const code = genCode(5); // 5桁の数字を生成
-  const expiresAt = now() + minutes(30);
-  try {
-    const dbx = getDb();
-    
-    // ▼▼▼ この部分を修正 ▼▼▼
-    // batch処理は不要。usersコレクションに直接書き込む
-    const userRef = dbx.collection('users').doc(appUserUid);
-    await userRef.update({
-      'pairingStatus.code': code,
-      'pairingStatus.expiresAt': admin.firestore.Timestamp.fromMillis(expiresAt),
-      'pairingStatus.status': 'waiting',
-    });
-    // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+    const appUserUid = req.auth.uid;
+    const code = String(Math.floor(Math.random() * 90000) + 10000); 
+    const expiresAt = now() + minutes(30);
 
-    res.json({ code, expiresAt });
-  } catch (e) {
-    console.error('[pair/create] failed:', e);
-    res.status(500).json({ error: 'Failed to issue a pair code.' });
-  }
+    try {
+        const dbx = getDb();
+        const userRef = dbx.collection('users').doc(appUserUid);
+        await userRef.update({
+            'pairingStatus.code': code,
+            'pairingStatus.expiresAt': admin.firestore.Timestamp.fromMillis(expiresAt),
+            'pairingStatus.status': 'waiting',
+        });
+        res.json({ code, expiresAt });
+    } catch (e) {
+        console.error('[pair/create] failed:', e);
+        res.status(500).json({ error: 'Failed to issue a pair code.' });
+    }
 });
 
 app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => {
