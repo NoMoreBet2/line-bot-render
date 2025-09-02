@@ -88,10 +88,12 @@ function shortId(uuid) {
 function makeDocId(ts, uuid) {
   return `${formatTs(ts)}-${shortId(uuid)}`;
 }
-function genCode(len = 6) {
-  const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-  return Array.from({ length: len }, () => ALPHABET[Math.floor(Math.random() * ALPHABET.length)]).join('');
+
+function genCode(len = 5) { // デフォルトの長さを5に変更
+  // 10000から99999までのランダムな整数を生成し、文字列として返す
+  return String(Math.floor(Math.random() * 90000) + 10000);
 }
+
 function reply(replyToken, text) {
   return client.replyMessage(replyToken, { type: 'text', text });
 }
@@ -207,7 +209,7 @@ async function handleEvent(event) {
 // ===== App APIs =====
 app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
   const appUserUid = req.auth.uid;
-  const code = genCode(6).toUpperCase();
+  const code = genCode(5); // ← 5桁の数字
   const expiresAt = now() + minutes(30);
   try {
     const dbx = getDb();
