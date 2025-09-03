@@ -387,35 +387,38 @@ app.get('/cron/check-heartbeats', async (req, res) => {
           batch.set(ping.ref, { status: 'expired', expiredAt: nowTs }, { merge: true });
 
           if (partnerLineUserId) {
-             // ▼▼▼ ここからが修正部分 ▼▼▼
-        
-        const lastHeartbeat = userDoc.data().blockStatus?.lastHeartbeat;
-        let timeString = "一定時間";
+           // ▼▼▼ ここからが修正部分 ▼▼▼
+            
+            // lastHeartbeatではなく、Pingの送信時刻 (sentAt) を取得
+            const sentAt = ping.data().sentAt;
+            let timeString = "一定時間";
 
-        if (lastHeartbeat) {
-            const date = lastHeartbeat.toDate();
-            // タイムスタンプを「月日 時:分」の形式に変換
-            timeString = new Intl.DateTimeFormat('ja-JP', {
-                month: 'numeric', // 月
-                day: 'numeric',   // 日
+            if (sentAt) {
+              const date = sentAt.toDate();
+              // タイムスタンプを「月日 時:分」の形式に変換
+              timeString = new Intl.DateTimeFormat('ja-JP', {
+                month: 'numeric',
+                day: 'numeric',
                 hour: '2-digit',
                 minute: '2-digit',
                 timeZone: 'Asia/Tokyo'
-            }).format(date);
-        }
-        
-        try {
-            await client.pushMessage(partnerLineUserId, {
+              }).format(date);
+            }
+            
+            try {
+              await client.pushMessage(partnerLineUserId, {
                 type: 'text',
+                // メッセージの文面も、より正確な表現に修正
                 text:
-                    `【nomoreBET お知らせ】\n` +
-                    `パートナーの端末から、ブロック機能が有効であることを示す定期的な信号が途絶えています。\n\n` +
-                    `${timeString}ごろ、ブロック機能が一時的に無効になっていた可能性があります。パートナーの方にご確認ください。\n\n` +
-                    `※端末の電源OFF、圏外、設定変更などが原因の場合もあります。`
-            });
-        } catch (e) {
-            console.error('[cron] LINE push error:', e);
-        }
+                  `【nomoreBET お知らせ】\n` +
+                  `パートナーの端末との通信が途絶えています。\n\n` +
+                  `${timeString}ごろに送信した確認に応答がなかったため、ブロック機能が一時的に無効になっている可能性があります。パートナーの方にご確認ください。\n\n` +
+                  `※端末の電源OFF、圏外、設定変更などが原因の場合もあります。`
+              });
+            } catch (e) {
+              console.error('[cron] LINE push error:', e);
+            }
+            // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
           }
         }
         await batch.commit();
