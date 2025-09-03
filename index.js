@@ -299,7 +299,7 @@ app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
     if (partnerLineUserId && pairingStatus.status === 'paired') {
       await client.pushMessage(partnerLineUserId, {
         type: 'text',
-        text: '【NoMoreBet お知らせ】\nパートナーが強制解除機能を使用しました。'
+        text: '【nomoreBET お知らせ】\nパートナーが強制解除機能を使用しました。'
       });
       console.log(`[force-unlock] 通知を送信しました: user=${uid}, partner=${partnerLineUserId}`);
     }
@@ -388,34 +388,34 @@ app.get('/cron/check-heartbeats', async (req, res) => {
 
           if (partnerLineUserId) {
              // ▼▼▼ ここからが修正部分 ▼▼▼
-                
-                // 最後にハートビートが確認された時刻を取得
-                const lastHeartbeat = userDoc.data().blockStatus?.lastHeartbeat;
-                let timeString = "一定時間"; // デフォルトの文言
+        
+        const lastHeartbeat = userDoc.data().blockStatus?.lastHeartbeat;
+        let timeString = "一定時間";
 
-                if (lastHeartbeat) {
-                    // タイムスタンプを日本のタイムゾーンに変換して、時と分だけを取得
-                    const date = lastHeartbeat.toDate();
-                    timeString = new Intl.DateTimeFormat('ja-JP', {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                        timeZone: 'Asia/Tokyo'
-                    }).format(date);
-                }
-                
-                try {
-                    await client.pushMessage(partnerLineUserId, {
-                        type: 'text',
-                        text:
-                            `【nomoreBET お知らせ】\n` +
-                            `パートナーの端末から、ブロック機能が有効であることを示す定期的な信号が途絶えています。\n\n` +
-                            `${timeString}ごろ、ブロック機能が一時的に無効になっていた可能性があります。パートナーの方にご確認ください。\n\n` +
-                            `※端末の電源OFF、圏外、設定変更などが原因の場合もあります。`
-                    });
-                } catch (e) {
-                    console.error('[cron] LINE push error:', e);
-                }
-                // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+        if (lastHeartbeat) {
+            const date = lastHeartbeat.toDate();
+            // タイムスタンプを「月日 時:分」の形式に変換
+            timeString = new Intl.DateTimeFormat('ja-JP', {
+                month: 'numeric', // 月
+                day: 'numeric',   // 日
+                hour: '2-digit',
+                minute: '2-digit',
+                timeZone: 'Asia/Tokyo'
+            }).format(date);
+        }
+        
+        try {
+            await client.pushMessage(partnerLineUserId, {
+                type: 'text',
+                text:
+                    `【nomoreBET お知らせ】\n` +
+                    `パートナーの端末から、ブロック機能が有効であることを示す定期的な信号が途絶えています。\n\n` +
+                    `${timeString}ごろ、ブロック機能が一時的に無効になっていた可能性があります。パートナーの方にご確認ください。\n\n` +
+                    `※端末の電源OFF、圏外、設定変更などが原因の場合もあります。`
+            });
+        } catch (e) {
+            console.error('[cron] LINE push error:', e);
+        }
           }
         }
         await batch.commit();
