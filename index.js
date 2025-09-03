@@ -387,20 +387,35 @@ app.get('/cron/check-heartbeats', async (req, res) => {
           batch.set(ping.ref, { status: 'expired', expiredAt: nowTs }, { merge: true });
 
           if (partnerLineUserId) {
-            const readableId = ping.data().readableId || '(no-id)';
-            const sentAt = ping.data().sentAt;
-            const sentStr = sentAt ? new Date(sentAt.toMillis()).toLocaleString('ja-JP') : '不明';
-            try {
-              await client.pushMessage(partnerLineUserId, {
-                type: 'text',
-                text:
-                  `【NoMoreBet お知らせ】\n` +
-                  `確認用の通知に応答がありませんでした（ID: ${readableId} / 送信: ${sentStr}）。\n` +
-                  `端末の電源OFF・セーフモード・圏外・端末設定などの可能性があります。`
-              });
-            } catch (e) {
-              console.error('[cron] LINE push error:', e);
-            }
+             // ▼▼▼ ここからが修正部分 ▼▼▼
+                
+                // 最後にハートビートが確認された時刻を取得
+                const lastHeartbeat = userDoc.data().blockStatus?.lastHeartbeat;
+                let timeString = "一定時間"; // デフォルトの文言
+
+                if (lastHeartbeat) {
+                    // タイムスタンプを日本のタイムゾーンに変換して、時と分だけを取得
+                    const date = lastHeartbeat.toDate();
+                    timeString = new Intl.DateTimeFormat('ja-JP', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        timeZone: 'Asia/Tokyo'
+                    }).format(date);
+                }
+                
+                try {
+                    await client.pushMessage(partnerLineUserId, {
+                        type: 'text',
+                        text:
+                            `【nomoreBET お知らせ】\n` +
+                            `パートナーの端末から、ブロック機能が有効であることを示す定期的な信号が途絶えています。\n\n` +
+                            `${timeString}ごろ、ブロック機能が一時的に無効になっていた可能性があります。パートナーの方にご確認ください。\n\n` +
+                            `※端末の電源OFF、圏外、設定変更などが原因の場合もあります。`
+                    });
+                } catch (e) {
+                    console.error('[cron] LINE push error:', e);
+                }
+                // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
           }
         }
         await batch.commit();
