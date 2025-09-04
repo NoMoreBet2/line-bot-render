@@ -423,7 +423,7 @@ app.post('/api/sendPromiseNotification', firebaseAuthMiddleware, async (req, res
     // LINEメッセージを作成
     const message = {
       type: 'text',
-      text: `【nomoreBET お知らせ】\nパートナーが新しい約束を登録しました：\n\n「${promise}」`,
+      text: `【nomoreBET お知らせ】\nパートナーが約束しました：\n\n「${promise}」`,
     };
 
     // LINEにメッセージをプッシュ送信
