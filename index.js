@@ -396,6 +396,48 @@ app.post('/ack-ping', async (req, res) => { // ★ ここから firebaseAuthMidd
   }
 });
 
+
+// パートナーに約束の通知を送信するAPI
+app.post('/api/sendPromiseNotification', firebaseAuthMiddleware, async (req, res) => {
+  // firebaseAuthMiddlewareによって、リクエストの認証とuidの取得が自動的に行われます。
+  const uid = req.auth.uid;
+  const dbx = getDb();
+
+  try {
+    const userSnap = await dbx.collection('users').doc(uid).get();
+    if (!userSnap.exists) {
+      console.warn(`[promise-notify] User not found for uid=${uid}`);
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const pairingStatus = userSnap.data().pairingStatus || {};
+    const partnerLineUserId = pairingStatus.partnerLineUserId;
+    const promise = pairingStatus.promise; // Firestoreから約束の内容を取得
+
+    // パートナーが設定されておらず、約束も存在しない場合はエラーを返す
+    if (!partnerLineUserId || pairingStatus.status !== 'paired' || !promise) {
+      console.warn(`[promise-notify] Invalid request for uid=${uid}. Missing partner or promise.`);
+      return res.status(400).json({ error: 'Partner is not configured or promise is missing.' });
+    }
+
+    // LINEメッセージを作成
+    const message = {
+      type: 'text',
+      text: `【nomoreBET お知らせ】\nパートナーが新しい約束を登録しました：\n\n「${promise}」`,
+    };
+
+    // LINEにメッセージをプッシュ送信
+    await client.pushMessage(partnerLineUserId, message);
+    
+    console.log(`[promise-notify] 通知を送信しました: user=${uid}, partner=${partnerLineUserId}`);
+    res.json({ ok: true });
+
+  } catch (e) {
+    console.error(`[promise-notify] failed for user ${uid}:`, e);
+    res.status(500).json({ error: 'Failed to send notification.' });
+  }
+});
+
 // ===== Cron：1) 期限切れ回収→通知 2) 未HBユーザーへ ping 3) 古いログ掃除 =====
 app.get('/cron/check-heartbeats', async (req, res) => {
   if (!CRON_SECRET || req.query.secret !== CRON_SECRET) {
