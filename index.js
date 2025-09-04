@@ -3,7 +3,7 @@
 const express = require('express');
 const line = require('@line/bot-sdk');
 const admin = require('firebase-admin');
-const crypto = require('crypto');
+const crypto = require('crypto'); // cryptoモジュールはここにあるので追加不要
 
 // ===== Env =====
 const PORT = process.env.PORT || 3000;
@@ -51,6 +51,9 @@ app.get('/healthz', (_, res) => res.send('healthy'));
 const client = new line.Client(lineConfig);
 
 // ===== Firebase Auth MW =====
+// ★ 修正点1-A: firebaseAuthMiddleware は /ack-ping で使用されなくなるため、そのまま残しておくか削除するかはお好みで。
+//             他のAPIで使う場合は残し、使わないなら削除またはコメントアウトして良い。
+//             今回は /ack-ping から削除するだけで、定義自体は残します。
 const firebaseAuthMiddleware = async (req, res, next) => {
   const authHeader = req.headers.authorization || '';
   if (!authHeader.startsWith('Bearer ')) {
@@ -117,7 +120,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   try {
     await Promise.all((req.body.events || []).map(handleEvent));
   } catch (e) {
-    console.error('[webhook] error', e);
+      console.error('[webhook] error', e);
   }
 });
 
@@ -192,7 +195,7 @@ async function handleEvent(event) {
     if (event.type === 'postback') {
         const data = event.postback?.data || '';
         const ap = /^approve:(.+)$/i.exec(data);
-        const rj = /^reject:(.+)$/i.exec(data);
+        const rj = /^reject:(.+)$i/.exec(data);
         if (ap) {
             const appUserUid = ap[1];
             try {
@@ -334,13 +337,42 @@ app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
 });
 
 // ACK: waiting→replied（期限超過は replied_late）
-app.post('/ack-ping', firebaseAuthMiddleware, async (req, res) => {
-  const uid = req.auth.uid;
+// ▼▼▼ 修正点2-A: firebaseAuthMiddleware を削除 ▼▼▼
+app.post('/ack-ping', async (req, res) => { // ★ ここから firebaseAuthMiddleware を削除 ★
+  const uid = req.body?.uid;         // アプリから送られてくる uid を取得
+  const fcmTokenFromApp = req.body?.fcmToken; // アプリから送られてくる fcmToken を取得
   const pingId = req.body?.pingId;
-  if (!pingId) return res.status(400).json({ error: 'pingId is required' });
+
+  // ▼▼▼ 修正点2-B: 送信された認証情報の基本的な検証 ▼▼▼
+  if (!pingId || !uid || !fcmTokenFromApp) {
+    console.warn('[ack-ping] 400 Bad Request: Missing pingId, uid, or fcmToken. body:', req.body);
+    return res.status(400).json({ error: 'pingId, uid, and fcmToken are required' });
+  }
+
   try {
     const dbx = getDb();
     const userRef = dbx.collection('users').doc(uid);
+    const userSnap = await userRef.get();
+
+    // ユーザーが存在しない場合
+    if (!userSnap.exists) {
+      console.warn(`[ack-ping] User not found for uid=${uid}`);
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const deviceStatus = userSnap.data()?.deviceStatus || {};
+    const storedFcmToken = deviceStatus.fcmToken;
+
+    // ▼▼▼ 修正点2-C: Firestoreに保存されているFCMトークンとの比較検証 ▼▼▼
+    if (storedFcmToken !== fcmTokenFromApp) {
+      console.warn(`[ack-ping] Unauthorized: FCM token mismatch for uid=${uid}. App token=${fcmTokenFromApp}, Stored token=${storedFcmToken}`);
+      // セキュリティのため、詳細なエラーはクライアントに返さない方が良い場合もあるが、デバッグのため暫定的に出す
+      return res.status(403).json({ error: 'Unauthorized: Invalid device token' });
+    }
+    // ▲▲▲ 認証情報の検証終わり ▲▲▲
+
+
+    // 以下、既存のACK処理ロジック (変更なし)
     const q = await userRef.collection('pendingPings').where('id', '==', pingId).limit(1).get();
     if (q.empty) {
       console.warn(`[ack-ping] ping not found for user ${uid}, pingId=${pingId}`);
@@ -465,7 +497,6 @@ app.get('/cron/check-heartbeats', async (req, res) => {
       }
 
       const pingUuid = crypto.randomUUID();
-      // 修正：formatTs を使って日本時間でフォーマットした文字列を makeDocId に渡す
       const japanFormattedNow = formatTs(nowTs); 
       const docId = makeDocId(japanFormattedNow, pingUuid);
       const expiresAt = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() + PING_ACK_WINDOW_MS);
@@ -480,11 +511,17 @@ app.get('/cron/check-heartbeats', async (req, res) => {
       });
 
       try {
+        // ▼▼▼ 修正点3-A: FCMメッセージのデータペイロードに `uid` を追加 ▼▼▼
         await admin.messaging().send({
           token: fcmToken,
-          data: { action: 'ping_challenge', pingId: pingUuid },
+          data: { 
+            action: 'ping_challenge', 
+            pingId: pingUuid,
+            uid: uid // ★ ここでユーザーIDを追加 ★
+          },
           android: { priority: 'high', ttl: PING_TTL_MS },
         });
+        // ▲▲▲ 修正点3-A 終わり ▲▲▲
 
         // 送信成功：連続失敗をリセット
         await userRef.set({
