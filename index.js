@@ -45,7 +45,7 @@ const getDb = () => {
 const app = express();
 app.get('/', (_, res) => res.send('LINE Bot is running!'));
 app.get('/healthz', (_, res) => res.send('healthy'));
-// ★ express.json() はWebhookの後で読み込むので、ここでは削除
+// express.json() はWebhookの後で読み込むので、ここでは削除
 
 // ===== LINE =====
 const client = new line.Client(lineConfig);
@@ -59,7 +59,7 @@ const firebaseAuthMiddleware = async (req, res, next) => {
   const idToken = authHeader.substring('Bearer '.length);
   try {
     const decoded = await admin.auth().verifyIdToken(idToken);
-    req.auth = { uid: decoded.uid, email: decoded.email }; // ★ emailも取得するように変更
+    req.auth = { uid: decoded.uid, email: decoded.email }; // emailも取得するように変更
     next();
   } catch (error) {
     console.error('[auth] verifyIdToken error:', error);
@@ -74,7 +74,9 @@ const hours = (n) => n * 60 * 60 * 1000;
 const pad2 = (n) => String(n).padStart(2, '0');
 
 function formatTs(ts) {
-  const d = ts.toDate();
+  // `ts` が admin.firestore.Timestamp か、すでにDateオブジェクトかを判別
+  const d = (ts && typeof ts.toDate === 'function') ? ts.toDate() : ts;
+  
   // toLocaleStringを使用して、常に日本のタイムゾーンでフォーマットする
   const dateTimeString = d.toLocaleString('ja-JP', {
     timeZone: 'Asia/Tokyo',
@@ -89,11 +91,14 @@ function formatTs(ts) {
   // これを "2025-09-04-16-27" の形式に置換する
   return dateTimeString.replace(/\//g, '-').replace(' ', '-');
 }
+
 function shortId(uuid) {
   return uuid.replace(/-/g, '').slice(0, 6).toUpperCase();
 }
-function makeDocId(ts, uuid) {
-  return `${formatTs(ts)}-${shortId(uuid)}`;
+
+// 修正：makeDocId はタイムスタンプではなく、既に日本時間でフォーマットされた日付文字列を受け取るように変更
+function makeDocId(formattedTsStr, uuid) {
+  return `${formattedTsStr}-${shortId(uuid)}`;
 }
 
 function genCode(len = 5) { // デフォルトの長さを5に変更
@@ -116,12 +121,11 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   }
 });
 
-// ★ 修正点：express.json() をここに移動
+// 修正点：express.json() をここに移動
 // これ以降のAPIルートでは、JSONボディが自動的にオブジェクトにパースされる
 app.use(express.json());
 
 
-// ▼▼▼ この handleEvent 関数を修正します ▼▼▼
 async function handleEvent(event) {
   if (event.type === 'message' && event.message?.type === 'text' && event.source?.userId) {
         const text = (event.message.text || '').trim();
@@ -152,7 +156,6 @@ async function handleEvent(event) {
                 const userDoc = usersQuery.docs[0];
                 const pairingStatus = userDoc.data().pairingStatus || {};
                 
-                // --- ▼▼▼ ここが最重要の修正点 ▼▼▼ ---
                 const expiresAt = pairingStatus.expiresAt;
                 let expiresAtMillis = 0;
 
@@ -167,7 +170,6 @@ async function handleEvent(event) {
                 if (!expiresAt || expiresAtMillis < Date.now()) {
                     return reply(event.replyToken, `コード ${pairingCode} は有効期限切れです。`);
                 }
-                // --- ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲ ---
 
                 const partnerProfile = await client.getProfile(partnerLineUserId);
                 await userDoc.ref.update({
@@ -239,13 +241,13 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
 });
 
 app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => {
-  // ★ ユーザーのemailとuidを認証ミドルウェアから受け取る
+  // ユーザーのemailとuidを認証ミドルウェアから受け取る
   const uid = req.auth.uid;
   const email = req.auth.email;
   const dbx = getDb();
 
   try {
-    // ★ テスト用メールアドレスの場合の特別処理
+    // テスト用メールアドレスの場合の特別処理
     if (email === "nomorebettest@gmail.com") {
       const userRef = dbx.collection('users').doc(uid);
       await userRef.update({
@@ -256,7 +258,7 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
       return res.json({ ok: true, message: 'Auto-unlocked for test user.' });
     }
 
-    // ★ 通常ユーザーの処理
+    // 通常ユーザーの処理
     const userRef = dbx.collection('users').doc(uid);
     const userSnap = await userRef.get();
     if (!userSnap.exists) return res.status(404).json({ error: 'User not found' });
@@ -288,7 +290,7 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
 });
 
 
-// ▼▼▼ 強制解除の通知API ▼▼▼
+// 強制解除の通知API
 app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   try {
@@ -317,7 +319,6 @@ app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
     res.status(500).json({ error: 'Failed to send notification.' });
   }
 });
-// ▲▲▲ ここまで ▲▲▲
 
 // Heartbeat: lastHeartbeat のみ更新
 app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
@@ -394,9 +395,7 @@ app.get('/cron/check-heartbeats', async (req, res) => {
           batch.set(ping.ref, { status: 'expired', expiredAt: nowTs }, { merge: true });
 
           if (partnerLineUserId) {
-           // ▼▼▼ ここからが修正部分 ▼▼▼
-            
-            // lastHeartbeatではなく、Pingの送信時刻 (sentAt) を取得
+           // lastHeartbeatではなく、Pingの送信時刻 (sentAt) を取得
             const sentAt = ping.data().sentAt;
             let timeString = "一定時間";
 
@@ -415,7 +414,7 @@ app.get('/cron/check-heartbeats', async (req, res) => {
             try {
               await client.pushMessage(partnerLineUserId, {
                 type: 'text',
-                // ▼▼▼ 文面を元の状態に戻しました ▼▼▼
+                // 文面を元の状態に戻しました
                 text:
                   `【nomoreBET お知らせ】\n` +
                   `パートナーの端末から、ブロック機能が有効であることを示す定期的な信号が途絶えています。\n\n` +
@@ -425,7 +424,6 @@ app.get('/cron/check-heartbeats', async (req, res) => {
             } catch (e) {
               console.error('[cron] LINE push error:', e);
             }
-            // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
           }
         }
         await batch.commit();
@@ -467,7 +465,9 @@ app.get('/cron/check-heartbeats', async (req, res) => {
       }
 
       const pingUuid = crypto.randomUUID();
-      const docId = makeDocId(nowTs, pingUuid);
+      // 修正：formatTs を使って日本時間でフォーマットした文字列を makeDocId に渡す
+      const japanFormattedNow = formatTs(nowTs); 
+      const docId = makeDocId(japanFormattedNow, pingUuid);
       const expiresAt = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() + PING_ACK_WINDOW_MS);
 
       await userRef.collection('pendingPings').doc(docId).set({
