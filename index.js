@@ -75,12 +75,19 @@ const pad2 = (n) => String(n).padStart(2, '0');
 
 function formatTs(ts) {
   const d = ts.toDate();
-  const y = d.getFullYear();
-  const M = pad2(d.getMonth() + 1);
-  const D = pad2(d.getDate());
-  const H = pad2(d.getHours());
-  const m = pad2(d.getMinutes());
-  return `${y}-${M}-${D}-${H}-${m}`;
+  // toLocaleStringを使用して、常に日本のタイムゾーンでフォーマットする
+  const dateTimeString = d.toLocaleString('ja-JP', {
+    timeZone: 'Asia/Tokyo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false // 24時間表記
+  });
+  // toLocaleStringは "2025/09/04 16:27" のような形式を返すため、
+  // これを "2025-09-04-16-27" の形式に置換する
+  return dateTimeString.replace(/\//g, '-').replace(' ', '-');
 }
 function shortId(uuid) {
   return uuid.replace(/-/g, '').slice(0, 6).toUpperCase();
