@@ -8,6 +8,8 @@ const crypto = require('crypto'); // cryptoモジュールはここにあるの�
 // ===== Env =====
 const PORT = process.env.PORT || 3000;
 const CRON_SECRET = process.env.CRON_SECRET || '';
+const PROBE_SECRET = process.env.PROBE_SECRET || ''; // ★ 追加: HMAC用共有鍵
+
 const lineConfig = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET,
@@ -195,7 +197,7 @@ async function handleEvent(event) {
     if (event.type === 'postback') {
         const data = event.postback?.data || '';
         const ap = /^approve:(.+)$/i.exec(data);
-        const rj = /^reject:(.+)$i/.exec(data);
+        const rj = /^reject:(.+)$/i.exec(data);
         if (ap) {
             const appUserUid = ap[1];
             try {
@@ -300,8 +302,10 @@ app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
     const dbx = getDb();
     const userSnap = await dbx.collection('users').doc(uid).get();
     if (!userSnap.exists) {
+
       // ユーザーが見つからない場合は何もしない
-      return res.status(4404).json({ error: 'User not found' });
+
+      return res.status(404).json({ error: 'User not found' });
     }
 
     const pairingStatus = userSnap.data().pairingStatus || {};
@@ -649,6 +653,27 @@ app.get('/cron/check-heartbeats', async (req, res) => {
     return res.status(500).json({ error: 'Internal error' });
   }
 });
+
+// ===== Probe (Screen Time 陽性証明：HMAC) =====
+// GET /probe/check?nonce=...  ->  { alg: "HS256", sig: "..." }
+app.get('/probe/check', (req, res) => {
+  if (!PROBE_SECRET) return res.status(500).json({ error: 'PROBE_SECRET not set' });
+
+  const nonce = String(req.query.nonce || '');
+  // 英数と一部記号のみ、長さ 8〜128 をざっくり許可
+  if (!/^[A-Za-z0-9._~\-]{8,128}$/.test(nonce)) {
+    return res.status(400).json({ error: 'bad nonce' });
+  }
+
+  const sig = crypto
+    .createHmac('sha256', PROBE_SECRET)
+    .update(nonce, 'utf8')
+    .digest('base64'); // base64urlにしたい場合は置換してください
+
+  res.set('Cache-Control', 'no-store'); // キャッシュ禁止
+  res.json({ alg: 'HS256', sig });
+});
+
 
 // ===== Boot =====
 (async () => {
