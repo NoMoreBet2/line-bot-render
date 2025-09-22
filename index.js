@@ -80,8 +80,71 @@ function makeDocId(formattedTsStr, uuid) { return `${formattedTsStr}-${shortId(u
 function genCode() { return String(Math.floor(Math.random() * 90000) + 10000); } // 5桁数字
 function reply(replyToken, text) { return client.replyMessage(replyToken, { type: 'text', text }); }
 
+// ===== 表示情報ヘルパー =====
+async function getUserDisplayInfo(uid) {
+  const dbx = getDb();
+  const ref = dbx.collection('users').doc(uid);
+  const snap = await ref.get();
+
+  let displayName = null;
+  let photoUrl = null;
+
+  if (snap.exists) {
+    const d = snap.data() || {};
+    displayName =
+      d.displayName ||
+      (d.lineProfile && d.lineProfile.displayName) ||
+      null;
+
+    photoUrl =
+      d.photoUrl ||
+      (d.lineProfile && d.lineProfile.pictureUrl) ||
+      null;
+  }
+
+  if (!displayName || !photoUrl) {
+    try {
+      const authUser = await admin.auth().getUser(uid);
+      if (!displayName) displayName = authUser.displayName || null;
+      if (!photoUrl)    photoUrl = authUser.photoURL || null;
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  return { displayName, photoUrl };
+}
+
+async function writeCrossPairProfiles(actorUid, partnerUid) {
+  const dbx = getDb();
+  const actorRef   = dbx.collection('users').doc(actorUid);
+  const partnerRef = dbx.collection('users').doc(partnerUid);
+
+  const [actorInfo, partnerInfo] = await Promise.all([
+    getUserDisplayInfo(actorUid),
+    getUserDisplayInfo(partnerUid),
+  ]);
+
+  await Promise.all([
+    actorRef.set({
+      pairingStatus: {
+        partnerUid: partnerUid,
+        partnerDisplayName: partnerInfo.displayName || '',
+        partnerPhotoUrl: partnerInfo.photoUrl || '',
+      }
+    }, { merge: true }),
+
+    partnerRef.set({
+      pairingStatus: {
+        partnerUid: actorUid,
+        partnerDisplayName: actorInfo.displayName || '',
+        partnerPhotoUrl: actorInfo.photoUrl || '',
+      }
+    }, { merge: true }),
+  ]);
+}
+
 // ===== LINE webhook =====
-// 署名検証のため、先に webhook を定義
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   res.sendStatus(200);
   try { await Promise.all((req.body.events || []).map(handleEvent)); }
@@ -100,7 +163,9 @@ async function acceptPairingWithCode({ code, partnerUid, partnerLineUserId }) {
     .get();
   if (snap.empty) throw new Error('invalid code');
 
-  const userDoc = snap.docs[0];
+  const userDoc = snap.docs[0];           // ← code を持っていた「当事者」doc
+  const actorUid = userDoc.id;
+
   const pairing = userDoc.data().pairingStatus || {};
   const expMs = (pairing.expiresAt?.toMillis?.()
     ? pairing.expiresAt.toMillis()
@@ -128,6 +193,29 @@ async function acceptPairingWithCode({ code, partnerUid, partnerLineUserId }) {
 
     tx.update(ref, updates);
   });
+
+  // ▼ ここから：相互プロフィール書き込み/LINEプロフィール反映
+  try {
+    if (partnerUid) {
+      // アプリ→アプリのペア確定：双方に相手の表示名・写真URLをコピー
+      await writeCrossPairProfiles(actorUid, partnerUid);
+    } else if (partnerLineUserId) {
+      // LINEからのペア確定：少なくとも当事者側にLINEプロフィールを保存しておく
+      try {
+        const prof = await client.getProfile(partnerLineUserId);
+        await userDoc.ref.set({
+          pairingStatus: {
+            partnerDisplayName: prof?.displayName || '',
+            partnerPhotoUrl: prof?.pictureUrl || '',
+          }
+        }, { merge: true });
+      } catch (e) {
+        console.warn('[pair] getProfile failed (non-fatal):', e?.message || e);
+      }
+    }
+  } catch (e) {
+    console.error('[pair] cross profile write failed (non-fatal):', e);
+  }
 
   return { ok: true };
 }
