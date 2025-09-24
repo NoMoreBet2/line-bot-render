@@ -1,0 +1,56 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() { return request.auth != null; }
+    function isSelf(userId) { return isSignedIn() && request.auth.uid == userId; }
+
+    function parentPairing(userId) {
+      return get(/databases/$(database)/documents/users/$(userId)).data.pairingStatus;
+    }
+    function isPairedWith(userId) {
+      return isSignedIn()
+        && parentPairing(userId).status == "paired"
+        && parentPairing(userId).partnerUid == request.auth.uid;
+    }
+
+    function clientWriteValid(old, neu) {
+      let changed = neu.diff(old).changedKeys();
+      if (changed.hasAny(['pairingStatus','blockStatus'])) return false;
+      if (changed.hasAny(['deviceStatus'])) {
+        let d = neu.deviceStatus;
+        if (d.fcmToken != null && !(d.fcmToken is string)) return false;
+        if (d.deviceName != null && !(d.deviceName is string)) return false;
+        if (d.isScreenTimeAuthorized != null && !(d.isScreenTimeAuthorized is bool)) return false;
+      }
+      if (changed.hasAny(['displayName']) && !(neu.displayName is string)) return false;
+      if (changed.hasAny(['emailVerified']) && !(neu.emailVerified is bool)) return false;
+      if (changed.hasAny(['lastLoginAt']) && !(neu.lastLoginAt is timestamp)) return false;
+      if (changed.hasAny(['role'])) {
+        let ok = ['actor','partner'].hasAny([neu.role]);
+        if (!ok) return false;
+      }
+      if (changed.hasAny(['roleSource'])) {
+        let ok = ['client','server'].hasAny([neu.roleSource]);
+        if (!ok) return false;
+      }
+      return true;
+    }
+
+    match /users/{userId} {
+      allow get, list: if isSelf(userId) || isPairedWith(userId);
+      allow create: if isSelf(userId) && clientWriteValid({}, request.resource.data);
+      allow update: if isSelf(userId) && clientWriteValid(resource.data, request.resource.data);
+      allow delete: if isSelf(userId);
+
+      match /{sub=**} {
+        allow get, list: if isSelf(userId) || isPairedWith(userId);
+        allow create, update, delete: if isSelf(userId);
+      }
+    }
+
+    // クライアントからは触らせない（Admin SDK はバイパス）
+    match /codes/{code} { allow read, write: if false; }
+    match /unlock_requests/{code} { allow read, write: if false; }
+  }
+}
