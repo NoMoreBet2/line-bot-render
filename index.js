@@ -80,110 +80,154 @@ function makeDocId(formattedTsStr, uuid) { return `${formattedTsStr}-${shortId(u
 function genCode() { return String(Math.floor(Math.random() * 90000) + 10000); } // 5桁数字
 function reply(replyToken, text) { return client.replyMessage(replyToken, { type: 'text', text }); }
 
-// 以降のAPIは JSON ボディをパース
 app.use(express.json());
 
-// ===== 共通：ペア確定ロジック（両者更新 & 冪等対応） =====
-/**
- * @param {{ code: string, partnerUid?: string, partnerLineUserId?: string }} params
- * - code: 5桁のペアリングコード（当事者の users/{actorUid}.pairingStatus.code）
- * - partnerUid: （任意）パートナー（＝このAPIを叩いているアプリのユーザ）の UID
- * - partnerLineUserId: （任意）LINE webhook から来たときの送信者 userId
- *
- * ・LINE 経由の受理（webhook）では partnerUid を持たないため、当事者側のみ更新。
- * ・アプリ経由の受理（/pair/accept）では partnerUid があるため、両者を更新。
- */
-async function acceptPairingWithCode({ code, partnerUid, partnerLineUserId }) {
+// ============================================================
+//  ペアリング（アプリ主導）: pairingCodes コレクション方式
+// ============================================================
+
+// 当事者：コード発行（表示用メタは users にも保存）
+app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
+  const uid = req.auth.uid;
   const dbx = getDb();
 
-  // 1) コード所有者（当事者）を特定
-  const snap = await dbx.collection('users')
-    .where('pairingStatus.code', '==', code)
-    .limit(1)
-    .get();
-  if (snap.empty) throw new Error('invalid code');
+  // 軽い衝突回避（5桁なので一応）
+  let code = genCode();
+  let tries = 0;
+  while (tries < 5) {
+    const ref = dbx.collection('pairingCodes').doc(code);
+    const snap = await ref.get();
+    if (!snap.exists) break;
+    code = genCode();
+    tries++;
+  }
+  if (tries >= 5) return res.status(500).json({ error: 'code generation failed' });
 
-  const actorDoc = snap.docs[0];
-  const actorUid = actorDoc.id;
+  const expiresAtMs = now() + minutes(30);
+  const expiresAt = admin.firestore.Timestamp.fromMillis(expiresAtMs);
 
-  // 有効期限チェック
-  const pairing = actorDoc.data().pairingStatus || {};
-  const expMs = (pairing.expiresAt?.toMillis?.()
-    ? pairing.expiresAt.toMillis()
-    : (typeof pairing.expiresAt === 'number' ? pairing.expiresAt : 0));
-  if (!expMs || Date.now() > expMs) throw new Error('expired');
+  try {
+    // pairingCodes に作成（1回きりの消費対象）
+    await dbx.collection('pairingCodes').doc(code).set({
+      ownerUid: uid,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt
+    });
 
-  // 2) トランザクション：冪等に両者を揃える
-  await dbx.runTransaction(async (tx) => {
-    const actorRef = dbx.collection('users').doc(actorUid);
-    const actorFresh = await tx.get(actorRef);
-    const curA = (actorFresh.data()?.pairingStatus) || {};
-    const curAStatus = curA.status || 'unpaired';
-    const curAPartner = curA.partnerUid || null;
-
-    // 冪等チェック（actor が既に paired）
-    if (curAStatus === 'paired') {
-      // すでに同じ相手or不明（LINE 受理で partnerUid 未設定）なら通す
-      if (!partnerUid || !curAPartner || curAPartner === partnerUid) {
-        // ここで partnerUid が渡ってきていて、かつ actor側 partnerUid が空なら補完
-        if (partnerUid && !curAPartner) {
-          tx.update(actorRef, { 'pairingStatus.partnerUid': partnerUid });
-        }
-      } else {
-        // 別の相手と既にペア
-        throw new Error('actor_already_paired');
+    // 表示/UX用に users 側へも反映（あくまでメタ）
+    await dbx.collection('users').doc(uid).set({
+      pairingStatus: {
+        status: 'waiting',
+        code,
+        expiresAt
       }
-    }
+    }, { merge: true });
 
-    // partnerUid がない（LINE 受理）→ actor 側のみ更新して終了
-    if (!partnerUid) {
-      const updates = {
-        'pairingStatus.status': 'paired',
-        'pairingStatus.pairedAt': admin.firestore.FieldValue.serverTimestamp(),
-        'pairingStatus.code': admin.firestore.FieldValue.delete(),
-        'pairingStatus.expiresAt': admin.firestore.FieldValue.delete(),
-      };
-      if (partnerLineUserId) updates['pairingStatus.partnerLineUserId'] = partnerLineUserId;
-      tx.set(actorRef, updates, { merge: true });
-      return;
-    }
+    res.json({ code, expiresAt: Math.floor(expiresAtMs / 1000) });
+  } catch (e) {
+    console.error('[pair/create] failed:', e);
+    res.status(500).json({ error: 'Failed to issue a pair code.' });
+  }
+});
 
-    // ここから partnerUid あり（アプリ受理）→ 両者更新
-    const partnerRef = dbx.collection('users').doc(partnerUid);
-    const partnerSnap = await tx.get(partnerRef);
-    const curP = (partnerSnap.exists ? (partnerSnap.data()?.pairingStatus) : null) || {};
-    const curPStatus = curP.status || 'unpaired';
-    const curPPartner = curP.partnerUid || null;
+// パートナー：コード入力（アプリ間ペアリング 確定）
+app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
+  const partnerUid = req.auth.uid; // B
+  const code = String(req.body?.code || '').trim();
+  if (!/^\d{5}$/.test(code)) return res.status(400).json({ message: 'bad code' });
 
-    // パートナー側が既に別相手とペアならNG（冪等：actorUid なら通す）
-    if (curPStatus === 'paired' && curPPartner && curPPartner !== actorUid) {
-      throw new Error('partner_already_paired');
-    }
+  const dbx = getDb();
+  const codeRef = dbx.collection('pairingCodes').doc(code);
 
-    // ===== 書き込み（両者を必ず symmetric に） =====
-    const nowTs = admin.firestore.FieldValue.serverTimestamp();
+  try {
+    await dbx.runTransaction(async (tx) => {
+      const codeSnap = await tx.get(codeRef);
+      if (!codeSnap.exists) throw new Error('invalid');
+      const { ownerUid, expiresAt } = codeSnap.data() || {};
+      if (!ownerUid) throw new Error('invalid');
+      if (ownerUid === partnerUid) throw new Error('self_pair');
 
-    // 当事者（actor）
-    const updatesActor = {
-      'pairingStatus.status': 'paired',
-      'pairingStatus.partnerUid': partnerUid,
-      'pairingStatus.pairedAt': nowTs,
-      'pairingStatus.code': admin.firestore.FieldValue.delete(),
-      'pairingStatus.expiresAt': admin.firestore.FieldValue.delete(),
+      const expMs = expiresAt?.toMillis?.() ?? 0;
+      if (!expMs || Date.now() > expMs) throw new Error('expired');
+
+      const actorRef = dbx.collection('users').doc(ownerUid);   // A
+      const partnerRef = dbx.collection('users').doc(partnerUid); // B
+
+      const [aSnap, pSnap] = await Promise.all([tx.get(actorRef), tx.get(partnerRef)]);
+      const a = aSnap.data()?.pairingStatus || {};
+      const p = pSnap.data()?.pairingStatus || {};
+
+      // 片方が別相手と確定済は拒否（同一相手なら冪等許容）
+      if (a.status === 'paired' && a.partnerUid && a.partnerUid !== partnerUid) throw new Error('actor_already_paired');
+      if (p.status === 'paired' && p.partnerUid && p.partnerUid !== ownerUid) throw new Error('partner_already_paired');
+
+      const nowTs = admin.firestore.FieldValue.serverTimestamp();
+
+      // 対称に確定
+      tx.set(actorRef, {
+        pairingStatus: {
+          status: 'paired',
+          partnerUid: partnerUid,
+          pairedAt: nowTs,
+          // 表示用メタは確定時に掃除
+          code: admin.firestore.FieldValue.delete(),
+          expiresAt: admin.firestore.FieldValue.delete(),
+          lineAccepted: admin.firestore.FieldValue.delete()
+        }
+      }, { merge: true });
+
+      tx.set(partnerRef, {
+        pairingStatus: {
+          status: 'paired',
+          partnerUid: ownerUid,
+          pairedAt: nowTs
+        }
+      }, { merge: true });
+
+      // ワンタイム消費
+      tx.delete(codeRef);
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    const msg = String(e.message || e);
+    const status =
+      /invalid|bad code|expired|self_pair/i.test(msg) ? 400 :
+      /actor_already_paired|partner_already_paired/i.test(msg) ? 409 : 500;
+    console.error('[pair/accept] failed:', msg);
+    res.status(status).json({ message: msg });
+  }
+});
+
+// ============================================================
+//  LINE 経由の受理（保持）: コードは削除しないでメタ付与のみ
+//  → 最終確定は /pair/accept（アプリ）で行う
+// ============================================================
+
+async function markLineAcceptedByCode(code, partnerLineUserId) {
+  const dbx = getDb();
+  const codeRef = dbx.collection('pairingCodes').doc(code);
+
+  await dbx.runTransaction(async (tx) => {
+    const codeSnap = await tx.get(codeRef);
+    if (!codeSnap.exists) throw new Error('invalid');
+    const { ownerUid, expiresAt } = codeSnap.data() || {};
+    if (!ownerUid) throw new Error('invalid');
+
+    const expMs = expiresAt?.toMillis?.() ?? 0;
+    if (!expMs || Date.now() > expMs) throw new Error('expired');
+
+    const actorRef = dbx.collection('users').doc(ownerUid);
+    const updates = {
+      'pairingStatus.status': 'waiting', // まだ確定ではない
+      'pairingStatus.lineAccepted': true,
+      'pairingStatus.partnerLineUserId': partnerLineUserId
     };
-    if (partnerLineUserId) updatesActor['pairingStatus.partnerLineUserId'] = partnerLineUserId;
-    tx.set(actorRef, updatesActor, { merge: true });
-
-    // パートナー（partner）
-    const updatesPartner = {
-      'pairingStatus.status': 'paired',
-      'pairingStatus.partnerUid': actorUid,
-      'pairingStatus.pairedAt': nowTs,
-    };
-    tx.set(partnerRef, updatesPartner, { merge: true });
+    tx.set(actorRef, updates, { merge: true });
+    // ★ pairingCodes は削除しない（Bアプリの /pair/accept で消費）
   });
 
-  return { ok: true, actorUid, partnerUid: partnerUid || null };
+  return { ok: true };
 }
 
 // ===== LINE webhook =====
@@ -194,7 +238,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 });
 
 async function handleEvent(event) {
-  // 1) LINEメッセージでのコード受領
+  // 1) LINEメッセージでのコード受領（保持のみ）
   if (event.type === 'message' && event.message?.type === 'text' && event.source?.userId) {
     const text = (event.message.text || '').trim();
     const partnerLineUserId = event.source.userId;
@@ -208,15 +252,13 @@ async function handleEvent(event) {
 
     if (pairingCode) {
       try {
-        // LINE からは partnerUid 不明 → actor 側のみ更新
-        await acceptPairingWithCode({ code: pairingCode, partnerLineUserId });
-        return reply(event.replyToken, 'ペアリングが完了しました ✅');
+        await markLineAcceptedByCode(pairingCode, partnerLineUserId);
+        return reply(event.replyToken, 'ペアリングリクエストを受け付けました。アプリでペアリングを完了してください。');
       } catch (error) {
         const msg = String(error.message || error);
         console.error('[webhook/pair] error', msg);
         if (/invalid/.test(msg)) return reply(event.replyToken, `コード ${pairingCode} は無効です。`);
         if (/expired/.test(msg)) return reply(event.replyToken, `コード ${pairingCode} は有効期限切れです。`);
-        if (/already_paired/.test(msg)) return reply(event.replyToken, 'すでに他の相手とペアになっています。');
         return reply(event.replyToken, 'エラーが発生しました。');
       }
     }
@@ -243,50 +285,9 @@ async function handleEvent(event) {
   }
 }
 
-// ===== App APIs =====
+// ===== 既存のその他API =====
 
-// 当事者：コード発行
-app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
-  const appUserUid = req.auth.uid;
-  const code = genCode();
-  const expiresAtMs = now() + minutes(30);
-  const expiresAtSec = Math.floor(expiresAtMs / 1000);
-  try {
-    const dbx = getDb();
-    const userRef = dbx.collection('users').doc(appUserUid);
-    await userRef.set({
-      pairingStatus: {
-        code,
-        expiresAt: admin.firestore.Timestamp.fromMillis(expiresAtMs),
-        status: 'waiting'
-      }
-    }, { merge: true });
-    res.json({ code, expiresAt: expiresAtSec });
-  } catch (e) {
-    console.error('[pair/create] failed:', e);
-    res.status(500).json({ error: 'Failed to issue a pair code.' });
-  }
-});
-
-// パートナー：コード入力（アプリ間ペアリング）
-app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
-  try {
-    const partnerUid = req.auth.uid;
-    const code = String(req.body?.code || '').trim();
-    if (!/^\d{5}$/.test(code)) return res.status(400).json({ message: 'bad code' });
-
-    const result = await acceptPairingWithCode({ code, partnerUid });
-    res.json({ ok: true, actorUid: result.actorUid, partnerUid: result.partnerUid });
-  } catch (e) {
-    const msg = String(e.message || e);
-    const status =
-      /invalid|expired|bad code/i.test(msg) ? 400 :
-      /actor_already_paired|partner_already_paired/i.test(msg) ? 409 : 500;
-    console.error('[pair/accept] failed:', msg);
-    res.status(status).json({ message: msg });
-  }
-});
-
+// 強制解除リクエスト（テストユーザの即時処理含む）
 app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   const email = req.auth.email;
