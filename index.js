@@ -25,7 +25,10 @@ const FCM_FAIL_THRESHOLD = Number(process.env.FCM_FAIL_THRESHOLD || 3);
 // ===== Firebase Admin =====
 let db = null;
 async function initAsync() {
-  if (admin.apps.length) { db = admin.firestore(); return; }
+  if (admin.apps.length) {
+    db = admin.firestore();
+    return;
+  }
   const sa = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   if (sa) admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
   else admin.initializeApp();
@@ -41,6 +44,12 @@ const getDb = () => {
 const app = express();
 app.get('/', (_, res) => res.send('LINE Bot is running!'));
 app.get('/healthz', (_, res) => res.send('healthy'));
+
+// ★★★ 重要：/webhook だけは express.json() を通さない（署名検証のための“生ボディ”保持）
+app.use((req, res, next) => {
+  if (req.path === '/webhook') return next();
+  return express.json()(req, res, next);
+});
 
 // ===== LINE =====
 const client = new line.Client(lineConfig);
@@ -80,10 +89,9 @@ function makeDocId(formattedTsStr, uuid) { return `${formattedTsStr}-${shortId(u
 function genCode() { return String(Math.floor(Math.random() * 90000) + 10000); } // 5桁数字
 function reply(replyToken, text) { return client.replyMessage(replyToken, { type: 'text', text }); }
 
-app.use(express.json());
-
 // ============================================================
 //  ペアリング（アプリ主導）: pairingCodes コレクション方式
+//  ※この 2 つのエンドポイントは“変更なし”（アプリ側は既に動作OK）
 // ============================================================
 
 // 当事者：コード発行（表示用メタは users にも保存）
@@ -201,7 +209,7 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
 
 // ============================================================
 //  LINE 経由の受理（保持）: コードは削除しないでメタ付与のみ
-//  → 最終確定は /pair/accept（アプリ）で行う
+//  → 最終確定は /pair/accept（アプリ）で行う（既存のまま）
 // ============================================================
 
 async function markLineAcceptedByCode(code, partnerLineUserId) {
@@ -224,64 +232,79 @@ async function markLineAcceptedByCode(code, partnerLineUserId) {
       'pairingStatus.partnerLineUserId': partnerLineUserId
     };
     tx.set(actorRef, updates, { merge: true });
-    // ★ pairingCodes は削除しない（Bアプリの /pair/accept で消費）
+    // pairingCodes は削除しない（Bアプリの /pair/accept で消費）
   });
 
   return { ok: true };
 }
 
 // ===== LINE webhook =====
+// 署名検証のため、“絶対に” express.json() を前段で通さないこと
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   res.sendStatus(200);
-  try { await Promise.all((req.body.events || []).map(handleEvent)); }
-  catch (e) { console.error('[webhook] error', e); }
+  try {
+    const events = req.body?.events || [];
+    console.log('[webhook] events=', JSON.stringify(events));
+    await Promise.all(events.map(handleEvent));
+  } catch (e) {
+    console.error('[webhook] error', e);
+  }
 });
 
 async function handleEvent(event) {
-  // 1) LINEメッセージでのコード受領（保持のみ）
-  if (event.type === 'message' && event.message?.type === 'text' && event.source?.userId) {
-    const text = (event.message.text || '').trim();
-    const partnerLineUserId = event.source.userId;
-    let pairingCode = null;
+  try {
+    // 1) LINEメッセージでのコード受領（保持のみ）
+    if (event.type === 'message' && event.message?.type === 'text' && event.source?.userId) {
+      const text = (event.message.text || '').trim();
+      const partnerLineUserId = event.source.userId;
+      let pairingCode = null;
 
-    if (/^\d{5}$/.test(text)) pairingCode = text;
-    else {
-      const m = /^pair\s+([A-Z0-9]{5,10})$/i.exec(text);
-      if (m) pairingCode = m[1].toUpperCase();
-    }
+      if (/^\d{5}$/.test(text)) {
+        pairingCode = text;
+      } else {
+        const m = /^pair\s+([A-Z0-9]{5,10})$/i.exec(text);
+        if (m) pairingCode = m[1].toUpperCase();
+      }
 
-    if (pairingCode) {
-      try {
-        await markLineAcceptedByCode(pairingCode, partnerLineUserId);
-        return reply(event.replyToken, 'ペアリングリクエストを受け付けました。アプリでペアリングを完了してください。');
-      } catch (error) {
-        const msg = String(error.message || error);
-        console.error('[webhook/pair] error', msg);
-        if (/invalid/.test(msg)) return reply(event.replyToken, `コード ${pairingCode} は無効です。`);
-        if (/expired/.test(msg)) return reply(event.replyToken, `コード ${pairingCode} は有効期限切れです。`);
-        return reply(event.replyToken, 'エラーが発生しました。');
+      if (pairingCode) {
+        try {
+          await markLineAcceptedByCode(pairingCode, partnerLineUserId);
+          return reply(event.replyToken, 'ペアリングリクエストを受け付けました。アプリでペアリングを完了してください。');
+        } catch (error) {
+          const msg = String(error.message || error);
+          console.error('[webhook/pair] error', msg);
+          if (/invalid/.test(msg)) return reply(event.replyToken, `コード ${pairingCode} は無効です。`);
+          if (/expired/.test(msg)) return reply(event.replyToken, `コード ${pairingCode} は有効期限切れです。`);
+          return reply(event.replyToken, 'エラーが発生しました。');
+        }
       }
     }
-  }
 
-  // 2) 解除ポストバック
-  if (event.type === 'postback') {
-    const data = event.postback?.data || '';
-    const ap = /^approve:(.+)$/i.exec(data);
-    const rj = /^reject:(.+)$/i.exec(data);
-    if (ap) {
-      const appUserUid = ap[1];
-      try {
-        const userRef = getDb().collection('users').doc(appUserUid);
-        await userRef.update({ 'blockStatus.isActive': false, 'blockStatus.activatedAt': null });
-        if (event.source?.userId) await client.pushMessage(event.source.userId, { type: 'text', text: '承認しました。' });
-      } catch (err) { console.error('[webhook/approve] failed:', err); }
-      return;
+    // 2) 解除ポストバック
+    if (event.type === 'postback') {
+      const data = event.postback?.data || '';
+      const ap = /^approve:(.+)$/i.exec(data);
+      const rj = /^reject:(.+)$/i.exec(data);
+      if (ap) {
+        const appUserUid = ap[1];
+        try {
+          const userRef = getDb().collection('users').doc(appUserUid);
+          await userRef.update({ 'blockStatus.isActive': false, 'blockStatus.activatedAt': null });
+          if (event.source?.userId) {
+            await client.pushMessage(event.source.userId, { type: 'text', text: '承認しました。' });
+          }
+        } catch (err) { console.error('[webhook/approve] failed:', err); }
+        return;
+      }
+      if (rj) {
+        if (event.source?.userId) {
+          await client.pushMessage(event.source.userId, { type: 'text', text: '解除申請を拒否しました。' });
+        }
+        return;
+      }
     }
-    if (rj) {
-      if (event.source?.userId) await client.pushMessage(event.source.userId, { type: 'text', text: '解除申請を拒否しました。' });
-      return;
-    }
+  } catch (err) {
+    console.error('[handleEvent] failed', err);
   }
 }
 
@@ -346,7 +369,7 @@ app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
     }
     res.json({ ok: true });
   } catch (e) {
-    console.error('[force-unlock-notify] failed:', e);
+    console.error('[force-unlock-notify] failed', e);
     res.status(500).json({ error: 'Failed to send notification.' });
   }
 });
