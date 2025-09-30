@@ -42,7 +42,7 @@ const app = express();
 app.get('/', (_, res) => res.send('LINE Bot is running!'));
 app.get('/healthz', (_, res) => res.send('healthy'));
 
-// /webhook は署名検証のために raw を通す（ここでは line.middleware に任せる）
+// /webhook は署名検証のため raw を通す（ここでは line.middleware に任せる）
 app.use((req, res, next) => {
   if (req.path === '/webhook') return next();
   return express.json()(req, res, next);
@@ -109,12 +109,14 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
   const expiresAt = admin.firestore.Timestamp.fromMillis(expiresAtMs);
 
   try {
+    // pairingCodes に作成（B側の受け取りで消費）
     await dbx.collection('pairingCodes').doc(code).set({
       ownerUid: uid,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       expiresAt
     });
 
+    // UX用メタ（表示）— waiting はLINE方式では使わないが、アプリ間では表示のためOK
     await dbx.collection('users').doc(uid).set({
       pairingStatus: { status: 'waiting', code, expiresAt }
     }, { merge: true });
@@ -152,16 +154,19 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
       const a = aSnap.data()?.pairingStatus || {};
       const p = pSnap.data()?.pairingStatus || {};
 
+      // 片方が別相手と確定済は拒否（同一相手なら冪等許容）
       if (a.status === 'paired' && a.partnerUid && a.partnerUid !== partnerUid) throw new Error('actor_already_paired');
       if (p.status === 'paired' && p.partnerUid && p.partnerUid !== ownerUid) throw new Error('partner_already_paired');
 
       const nowTs = admin.firestore.FieldValue.serverTimestamp();
 
+      // 対称に確定
       tx.set(actorRef, {
         pairingStatus: {
           status: 'paired',
           partnerUid: partnerUid,
           pairedAt: nowTs,
+          // 表示用メタは掃除
           code: admin.firestore.FieldValue.delete(),
           expiresAt: admin.firestore.FieldValue.delete(),
           lineAccepted: admin.firestore.FieldValue.delete()
@@ -172,6 +177,7 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
         pairingStatus: { status: 'paired', partnerUid: ownerUid, pairedAt: nowTs }
       }, { merge: true });
 
+      // ワンタイム消費
       tx.delete(codeRef);
     });
 
@@ -187,7 +193,7 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
 });
 
 // ============================================================
-//  LINE でコード入力 → その場で確定（paired）
+//  LINE でコード入力 → その場で確定（paired、冪等）
 // ============================================================
 async function finalizePairingByLine(code, partnerLineUserId) {
   const dbx = getDb();
@@ -205,25 +211,32 @@ async function finalizePairingByLine(code, partnerLineUserId) {
     const actorRef = dbx.collection('users').doc(ownerUid);
     const actorSnap = await tx.get(actorRef);
     const current = actorSnap.data()?.pairingStatus || {};
-
-    // すでに別相手と paired なら拒否（同じ相手なら冪等許容だが LINE は partnerUid を持たないのでチェックは owner 側のみ）
-    if (current.status === 'paired' && current.partnerUid) {
-      throw new Error('actor_already_paired');
-    }
-
     const nowTs = admin.firestore.FieldValue.serverTimestamp();
 
-    // LINE 方式：owner 側だけ確定（アプリを持たないパートナーのため partnerUid は無し）
+    // 既に paired の場合は冪等：partnerLineUserId だけ補完し、コードは掃除して終了
+    if (current.status === 'paired') {
+      tx.set(actorRef, {
+        'pairingStatus.partnerLineUserId': current.partnerLineUserId || partnerLineUserId || null,
+        'pairingStatus.code': admin.firestore.FieldValue.delete(),
+        'pairingStatus.expiresAt': admin.firestore.FieldValue.delete(),
+        'pairingStatus.lineAccepted': admin.firestore.FieldValue.delete(),
+      }, { merge: true });
+      tx.delete(codeRef);
+      return;
+    }
+
+    // LINE 方式：owner 側を確定（パートナーはLINEのみなので partnerUid は基本 null のまま）
     tx.set(actorRef, {
       pairingStatus: {
         status: 'paired',
-        partnerUid: current.partnerUid || null, // 既に同一相手で確定していれば維持、基本は null
+        partnerUid: current.partnerUid || null,
         partnerLineUserId,
-        pairedAt: nowTs,
-        code: admin.firestore.FieldValue.delete(),
-        expiresAt: admin.firestore.FieldValue.delete(),
-        lineAccepted: true
-      }
+        pairedAt: nowTs
+      },
+      // 競合跡の掃除
+      'pairingStatus.code': admin.firestore.FieldValue.delete(),
+      'pairingStatus.expiresAt': admin.firestore.FieldValue.delete(),
+      'pairingStatus.lineAccepted': admin.firestore.FieldValue.delete()
     }, { merge: true });
 
     // ワンタイム消費
@@ -238,7 +251,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   res.sendStatus(200);
   try {
     const events = req.body?.events || [];
-    console.log('[webhook] events=', JSON.stringify(events));
     await Promise.all(events.map(handleEvent));
   } catch (e) {
     console.error('[webhook] error', e);
@@ -268,7 +280,6 @@ async function handleEvent(event) {
           console.error('[webhook/pair-finalize] error', msg);
           if (/invalid/.test(msg)) return reply(event.replyToken, `コード ${pairingCode} は無効です。`);
           if (/expired/.test(msg)) return reply(event.replyToken, `コード ${pairingCode} は有効期限切れです。`);
-          if (/actor_already_paired/.test(msg)) return reply(event.replyToken, 'すでに別の相手とペアリング済みです。');
           return reply(event.replyToken, 'エラーが発生しました。');
         }
       }
@@ -300,6 +311,7 @@ async function handleEvent(event) {
 
 // ===== その他API（既存） =====
 
+// 強制解除リクエスト（テストユーザの即時処理含む）
 app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   const email = req.auth.email;
@@ -339,6 +351,7 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
   }
 });
 
+// 強制解除の通知API
 app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   try {
@@ -362,6 +375,7 @@ app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
   }
 });
 
+// Heartbeat
 app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   try {
@@ -374,6 +388,7 @@ app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
   }
 });
 
+// ACK: waiting→replied
 app.post('/ack-ping', async (req, res) => {
   const uid = req.body?.uid;
   const fcmTokenFromApp = req.body?.fcmToken;
@@ -423,6 +438,7 @@ app.get('/cron/check-heartbeats', async (req, res) => {
   const longOfflineCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - minutes(LONG_OFFLINE_MIN));
 
   try {
+    // 1) waiting期限切れ
     const allUsers = await dbx.collection('users').get();
     for (const userDoc of allUsers.docs) {
       const userRef = userDoc.ref;
@@ -465,6 +481,7 @@ app.get('/cron/check-heartbeats', async (req, res) => {
       }
     }
 
+    // 2) stale への ping
     const q = await dbx.collection('users')
       .where('blockStatus.isActive', '==', true)
       .where('blockStatus.lastHeartbeat', '<', staleCutoff)
@@ -546,7 +563,7 @@ app.get('/cron/check-heartbeats', async (req, res) => {
       }
     }
 
-    // cleanup
+    // 3) 古い ping の掃除（48h）
     try {
       const cleanupCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - hours(48));
       const allUsers2 = await dbx.collection('users').get();
