@@ -595,6 +595,52 @@ app.get('/probe/check', (req, res) => {
   res.json({ alg: 'HS256', sig });
 });
 
+// 承認（アプリ認証パートナー向け）：自分(=partnerUid)とペアの当事者を特定して解除
+app.post('/partner/approve-unlock-app', firebaseAuthMiddleware, async (req, res) => {
+  try {
+    const partnerUid = req.auth.uid;
+    const dbx = getDb();
+
+    // 自分(パートナー)の状態を確認
+    const partnerSnap = await dbx.collection('users').doc(partnerUid).get();
+    if (!partnerSnap.exists) return res.status(404).json({ error: 'partner not found' });
+    const p = partnerSnap.data()?.pairingStatus || {};
+    if (p.status !== 'paired') return res.status(400).json({ error: 'not paired' });
+
+    // 当事者を検索（どちらかのキーで統一：ここでは actor 側に partnerUid を保存している前提）
+    const q = await dbx.collection('users')
+      .where('pairingStatus.partnerUid', '==', partnerUid)
+      .limit(1)
+      .get();
+    if (q.empty) return res.status(404).json({ error: 'individual not found' });
+
+    const individualRef = q.docs[0].ref;
+    const individualUid = individualRef.id;
+
+    // 相互参照を最終確認（冪等＆なりすまし防止）
+    const indSnap = await individualRef.get();
+    const ind = indSnap.data()?.pairingStatus || {};
+    if (ind.status !== 'paired' || ind.partnerUid !== partnerUid) {
+      return res.status(403).json({ error: 'pairing mismatch' });
+    }
+
+    // 解除
+    await individualRef.set({
+      blockStatus: {
+        isActive: false,
+        activatedAt: null,
+        lastHeartbeat: admin.firestore.FieldValue.serverTimestamp()
+      }
+    }, { merge: true });
+
+    return res.json({ ok: true, individualUid });
+  } catch (e) {
+    console.error('[approve-unlock-app] failed', e);
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+
+
 // ===== Boot =====
 (async () => {
   try {
