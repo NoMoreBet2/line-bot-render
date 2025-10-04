@@ -116,7 +116,7 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
       expiresAt
     });
 
-    // UX用メタ（表示）— waiting はLINE方式では使わないが、アプリ間では表示のためOK
+    // UX用メタ（表示）
     await dbx.collection('users').doc(uid).set({
       pairingStatus: { status: 'waiting', code, expiresAt }
     }, { merge: true });
@@ -154,7 +154,6 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
       const a = aSnap.data()?.pairingStatus || {};
       const p = pSnap.data()?.pairingStatus || {};
 
-      // 片方が別相手と確定済は拒否（同一相手なら冪等許容）
       if (a.status === 'paired' && a.partnerUid && a.partnerUid !== partnerUid) throw new Error('actor_already_paired');
       if (p.status === 'paired' && p.partnerUid && p.partnerUid !== ownerUid) throw new Error('partner_already_paired');
 
@@ -166,7 +165,6 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
           status: 'paired',
           partnerUid: partnerUid,
           pairedAt: nowTs,
-          // 表示用メタは掃除
           code: admin.firestore.FieldValue.delete(),
           expiresAt: admin.firestore.FieldValue.delete(),
           lineAccepted: admin.firestore.FieldValue.delete()
@@ -213,7 +211,7 @@ async function finalizePairingByLine(code, partnerLineUserId) {
     const current = actorSnap.data()?.pairingStatus || {};
     const nowTs = admin.firestore.FieldValue.serverTimestamp();
 
-    // 既に paired の場合は冪等：partnerLineUserId だけ補完し、コードは掃除して終了
+    // 既に paired の場合は冪等：partnerLineUserId だけ補完
     if (current.status === 'paired') {
       tx.set(actorRef, {
         'pairingStatus.partnerLineUserId': current.partnerLineUserId || partnerLineUserId || null,
@@ -225,7 +223,7 @@ async function finalizePairingByLine(code, partnerLineUserId) {
       return;
     }
 
-    // LINE 方式：owner 側を確定（パートナーはLINEのみなので partnerUid は基本 null のまま）
+    // owner 側を確定
     tx.set(actorRef, {
       pairingStatus: {
         status: 'paired',
@@ -233,13 +231,11 @@ async function finalizePairingByLine(code, partnerLineUserId) {
         partnerLineUserId,
         pairedAt: nowTs
       },
-      // 競合跡の掃除
       'pairingStatus.code': admin.firestore.FieldValue.delete(),
       'pairingStatus.expiresAt': admin.firestore.FieldValue.delete(),
       'pairingStatus.lineAccepted': admin.firestore.FieldValue.delete()
     }, { merge: true });
 
-    // ワンタイム消費
     tx.delete(codeRef);
   });
 
@@ -259,7 +255,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
 async function handleEvent(event) {
   try {
-    // 1) 5桁コード or "pair XXXXX" を受けたら即確定
+    // 1) 5桁コード or "pair XXXXX"
     if (event.type === 'message' && event.message?.type === 'text' && event.source?.userId) {
       const text = (event.message.text || '').trim();
       const partnerLineUserId = event.source.userId;
@@ -285,7 +281,7 @@ async function handleEvent(event) {
       }
     }
 
-    // 2) 解除ポストバック（既存）
+    // 2) 解除ポストバック
     if (event.type === 'postback') {
       const data = event.postback?.data || '';
       const ap = /^approve:(.+)$/i.exec(data);
@@ -309,7 +305,7 @@ async function handleEvent(event) {
   }
 }
 
-// ===== その他API（既存） =====
+// ===== その他API =====
 
 // 強制解除リクエスト（テストユーザの即時処理含む）
 app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => {
@@ -578,6 +574,33 @@ app.get('/cron/check-heartbeats', async (req, res) => {
       }
     } catch (e) { console.error('[cron-cleanup] failed', e); }
 
+    // 4) 古い heartbeat_logs の掃除（2日＝48h）
+    try {
+      const hbCutoffTs = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - hours(48));
+      const hbCutoffMs = hbCutoffTs.toMillis();
+
+      const allUsersForHB = await dbx.collection('users').get();
+      const writer = admin.firestore().bulkWriter();
+
+      for (const userDoc of allUsersForHB.docs) {
+        const userRef = userDoc.ref;
+        const hbCol = userRef.collection('heartbeat_logs');
+
+        // case A: timestamp(Timestamp型) を基準に削除
+        const oldByTimestamp = await hbCol.where('timestamp', '<', hbCutoffTs).get();
+        for (const d of oldByTimestamp.docs) writer.delete(d.ref);
+
+        // case B: executedAt(Number ms) を基準に削除
+        const oldByExecutedAt = await hbCol.where('executedAt', '<', hbCutoffMs).get();
+        for (const d of oldByExecutedAt.docs) writer.delete(d.ref);
+      }
+
+      await writer.close();
+      console.log('[cron-cleanup] cleaned old heartbeat_logs up to', hbCutoffTs.toDate().toISOString());
+    } catch (e) {
+      console.error('[cron-cleanup-heartbeats] failed', e);
+    }
+
     return res.json({ ok: true, staleChecked: q.size });
   } catch (e) {
     console.error('[cron] failed', e);
@@ -601,13 +624,11 @@ app.post('/partner/approve-unlock-app', firebaseAuthMiddleware, async (req, res)
     const partnerUid = req.auth.uid;
     const dbx = getDb();
 
-    // 自分(パートナー)の状態を確認
     const partnerSnap = await dbx.collection('users').doc(partnerUid).get();
     if (!partnerSnap.exists) return res.status(404).json({ error: 'partner not found' });
     const p = partnerSnap.data()?.pairingStatus || {};
     if (p.status !== 'paired') return res.status(400).json({ error: 'not paired' });
 
-    // 当事者を検索（どちらかのキーで統一：ここでは actor 側に partnerUid を保存している前提）
     const q = await dbx.collection('users')
       .where('pairingStatus.partnerUid', '==', partnerUid)
       .limit(1)
@@ -617,14 +638,12 @@ app.post('/partner/approve-unlock-app', firebaseAuthMiddleware, async (req, res)
     const individualRef = q.docs[0].ref;
     const individualUid = individualRef.id;
 
-    // 相互参照を最終確認（冪等＆なりすまし防止）
     const indSnap = await individualRef.get();
     const ind = indSnap.data()?.pairingStatus || {};
     if (ind.status !== 'paired' || ind.partnerUid !== partnerUid) {
       return res.status(403).json({ error: 'pairing mismatch' });
     }
 
-    // 解除
     await individualRef.set({
       blockStatus: {
         isActive: false,
