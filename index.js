@@ -366,12 +366,12 @@ app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
   }
 });
 
-// Heartbeat（※ サーバ側は blockStatus.lastHeartbeat を更新）
+// Heartbeat（※ サーバ側は heartbeat.lastHeartbeat を更新）
 app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   try {
     const userRef = getDb().collection('users').doc(uid);
-    await userRef.update({ 'blockStatus.lastHeartbeat': admin.firestore.FieldValue.serverTimestamp() });
+    await userRef.update({ 'heartbeat.lastHeartbeat': admin.firestore.FieldValue.serverTimestamp() });
     res.json({ ok: true });
   } catch (e) {
     console.error(`[heartbeat] failed for user ${uid}`, e);
@@ -475,8 +475,8 @@ app.get('/cron/check-heartbeats', async (req, res) => {
     // 2) stale への ping
     const q = await dbx.collection('users')
       .where('blockStatus.isActive', '==', true)
-      .where('blockStatus.lastHeartbeat', '<', staleCutoff)
-      .where('blockStatus.lastHeartbeat', '>', longOfflineCutoff)
+      .where('heartbeat.lastHeartbeat', '<', staleCutoff)      // ← 参照先を修正
+      .where('heartbeat.lastHeartbeat', '>', longOfflineCutoff) // ← 参照先を修正
       .get();
 
     console.log('[cron] run', { at: new Date().toISOString(), staleCandidates: q.size });
@@ -642,8 +642,10 @@ app.post('/partner/approve-unlock-app', firebaseAuthMiddleware, async (req, res)
     await individualRef.set({
       blockStatus: {
         isActive: false,
-        activatedAt: null,
-        lastHeartbeat: admin.firestore.FieldValue.serverTimestamp()
+        activatedAt: null
+      },
+      heartbeat: {
+        lastHeartbeat: admin.firestore.FieldValue.serverTimestamp() // ← ここを heartbeat 直下に
       }
     }, { merge: true });
 
