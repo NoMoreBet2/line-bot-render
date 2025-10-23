@@ -207,36 +207,35 @@ async function finalizePairingByLine(code, partnerLineUserId) {
     const actorSnap = await tx.get(actorRef);
     const current = actorSnap.data()?.pairingStatus || {};
 
-    // 既に paired の場合は冪等：LINE ID だけ補完しつつ code/expire を消す（全部ドットパス）
+    // 既に paired の場合は冪等：partnerLineUserId だけ補完
     if (current.status === 'paired') {
       tx.set(actorRef, {
         'pairingStatus.partnerLineUserId': current.partnerLineUserId || partnerLineUserId || null,
         'pairingStatus.code': admin.firestore.FieldValue.delete(),
         'pairingStatus.expiresAt': admin.firestore.FieldValue.delete(),
-        'pairingStatus.lineAccepted': admin.firestore.FieldValue.delete()
+        'pairingStatus.lineAccepted': admin.firestore.FieldValue.delete(),
       }, { merge: true });
       tx.delete(codeRef);
       return;
     }
 
-    // waiting → paired へ（親オブジェクトは使わない）
-    const update = {
-      'pairingStatus.status': 'paired',
-      'pairingStatus.partnerLineUserId': partnerLineUserId,
+    // owner 側を確定（pairedAt は保存しない）
+    tx.set(actorRef, {
+      pairingStatus: {
+        status: 'paired',
+        partnerUid: current.partnerUid || null,
+        partnerLineUserId
+      },
       'pairingStatus.code': admin.firestore.FieldValue.delete(),
       'pairingStatus.expiresAt': admin.firestore.FieldValue.delete(),
       'pairingStatus.lineAccepted': admin.firestore.FieldValue.delete()
-    };
-    // partnerUid を既に持っていれば保持（null を上書きしない）
-    if (current.partnerUid) update['pairingStatus.partnerUid'] = current.partnerUid;
+    }, { merge: true });
 
-    tx.set(actorRef, update, { merge: true });
     tx.delete(codeRef);
   });
 
   return { ok: true };
 }
-
 
 // ===== LINE webhook =====
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
