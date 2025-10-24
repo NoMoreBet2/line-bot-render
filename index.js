@@ -157,20 +157,23 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
       if (a.status === 'paired' && a.partnerUid && a.partnerUid !== partnerUid) throw new Error('actor_already_paired');
       if (p.status === 'paired' && p.partnerUid && p.partnerUid !== ownerUid) throw new Error('partner_already_paired');
 
-      // 対称に確定（pairedAt は保存しない）
-      tx.set(actorRef, {
-        pairingStatus: {
-          status: 'paired',
-          partnerUid: partnerUid
-        },
+      // まず存在を保証（ドキュメントが無い場合でも update が通るように）
+      tx.set(actorRef, { pairingStatus: {} }, { merge: true });
+      tx.set(partnerRef, { pairingStatus: {} }, { merge: true });
+
+      // 対称に確定（pairedAt は保存しない）— update でドット指定＆DELETEを確実に反映
+      tx.update(actorRef, {
+        'pairingStatus.status': 'paired',
+        'pairingStatus.partnerUid': partnerUid,
         'pairingStatus.code': admin.firestore.FieldValue.delete(),
         'pairingStatus.expiresAt': admin.firestore.FieldValue.delete(),
-        'pairingStatus.lineAccepted': admin.firestore.FieldValue.delete()
-      }, { merge: true });
+        'pairingStatus.lineAccepted': admin.firestore.FieldValue.delete(),
+      });
 
-      tx.set(partnerRef, {
-        pairingStatus: { status: 'paired', partnerUid: ownerUid }
-      }, { merge: true });
+      tx.update(partnerRef, {
+        'pairingStatus.status': 'paired',
+        'pairingStatus.partnerUid': ownerUid,
+      });
 
       // ワンタイム消費
       tx.delete(codeRef);
@@ -207,29 +210,30 @@ async function finalizePairingByLine(code, partnerLineUserId) {
     const actorSnap = await tx.get(actorRef);
     const current = actorSnap.data()?.pairingStatus || {};
 
-    // 既に paired の場合は冪等：partnerLineUserId だけ補完
+    // まず存在を保証
+    tx.set(actorRef, { pairingStatus: {} }, { merge: true });
+
+    // 既に paired の場合は冪等：partnerLineUserId だけ補完 & 残骸削除
     if (current.status === 'paired') {
-      tx.set(actorRef, {
+      tx.update(actorRef, {
         'pairingStatus.partnerLineUserId': current.partnerLineUserId || partnerLineUserId || null,
         'pairingStatus.code': admin.firestore.FieldValue.delete(),
         'pairingStatus.expiresAt': admin.firestore.FieldValue.delete(),
         'pairingStatus.lineAccepted': admin.firestore.FieldValue.delete(),
-      }, { merge: true });
+      });
       tx.delete(codeRef);
       return;
     }
 
     // owner 側を確定（pairedAt は保存しない）
-    tx.set(actorRef, {
-      pairingStatus: {
-        status: 'paired',
-        partnerUid: current.partnerUid || null,
-        partnerLineUserId
-      },
+    tx.update(actorRef, {
+      'pairingStatus.status': 'paired',
+      'pairingStatus.partnerUid': current.partnerUid || null,
+      'pairingStatus.partnerLineUserId': partnerLineUserId,
       'pairingStatus.code': admin.firestore.FieldValue.delete(),
       'pairingStatus.expiresAt': admin.firestore.FieldValue.delete(),
-      'pairingStatus.lineAccepted': admin.firestore.FieldValue.delete()
-    }, { merge: true });
+      'pairingStatus.lineAccepted': admin.firestore.FieldValue.delete(),
+    });
 
     tx.delete(codeRef);
   });
@@ -472,11 +476,11 @@ app.get('/cron/check-heartbeats', async (req, res) => {
       }
     }
 
-    // 2) stale への ping
+    // 2) stale への ping（heartbeat.lastHeartbeat を参照）
     const q = await dbx.collection('users')
       .where('blockStatus.isActive', '==', true)
-      .where('heartbeat.lastHeartbeat', '<', staleCutoff)      // ← 参照先を修正
-      .where('heartbeat.lastHeartbeat', '>', longOfflineCutoff) // ← 参照先を修正
+      .where('heartbeat.lastHeartbeat', '<', staleCutoff)
+      .where('heartbeat.lastHeartbeat', '>', longOfflineCutoff)
       .get();
 
     console.log('[cron] run', { at: new Date().toISOString(), staleCandidates: q.size });
@@ -645,7 +649,7 @@ app.post('/partner/approve-unlock-app', firebaseAuthMiddleware, async (req, res)
         activatedAt: null
       },
       heartbeat: {
-        lastHeartbeat: admin.firestore.FieldValue.serverTimestamp() // ← ここを heartbeat 直下に
+        lastHeartbeat: admin.firestore.FieldValue.serverTimestamp()
       }
     }, { merge: true });
 
