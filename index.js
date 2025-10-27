@@ -161,21 +161,18 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
       tx.set(actorRef, { pairingStatus: {} }, { merge: true });
       tx.set(partnerRef, { pairingStatus: {} }, { merge: true });
 
-      // 対称に確定（pairedAt は保存しない）— update でドット指定＆DELETEを確実に反映
+      // 対称に確定（pairedAt は保存しない）— 不要フィールドの delete は行わない
       tx.update(actorRef, {
         'pairingStatus.status': 'paired',
-        'pairingStatus.partnerUid': partnerUid,
-        'pairingStatus.code': admin.firestore.FieldValue.delete(),
-        'pairingStatus.expiresAt': admin.firestore.FieldValue.delete(),
-        'pairingStatus.lineAccepted': admin.firestore.FieldValue.delete(),
+        'pairingStatus.partnerUid': partnerUid
       });
 
       tx.update(partnerRef, {
         'pairingStatus.status': 'paired',
-        'pairingStatus.partnerUid': ownerUid,
+        'pairingStatus.partnerUid': ownerUid
       });
 
-      // ワンタイム消費
+      // ワンタイム消費（これは必須）
       tx.delete(codeRef);
     });
 
@@ -213,13 +210,10 @@ async function finalizePairingByLine(code, partnerLineUserId) {
     // まず存在を保証
     tx.set(actorRef, { pairingStatus: {} }, { merge: true });
 
-    // 既に paired の場合は冪等：partnerLineUserId だけ補完 & 残骸削除
+    // 既に paired の場合は冪等：partnerLineUserId だけ補完
     if (current.status === 'paired') {
       tx.update(actorRef, {
-        'pairingStatus.partnerLineUserId': current.partnerLineUserId || partnerLineUserId || null,
-        'pairingStatus.code': admin.firestore.FieldValue.delete(),
-        'pairingStatus.expiresAt': admin.firestore.FieldValue.delete(),
-        'pairingStatus.lineAccepted': admin.firestore.FieldValue.delete(),
+        'pairingStatus.partnerLineUserId': current.partnerLineUserId || partnerLineUserId || null
       });
       tx.delete(codeRef);
       return;
@@ -229,10 +223,7 @@ async function finalizePairingByLine(code, partnerLineUserId) {
     tx.update(actorRef, {
       'pairingStatus.status': 'paired',
       'pairingStatus.partnerUid': current.partnerUid || null,
-      'pairingStatus.partnerLineUserId': partnerLineUserId,
-      'pairingStatus.code': admin.firestore.FieldValue.delete(),
-      'pairingStatus.expiresAt': admin.firestore.FieldValue.delete(),
-      'pairingStatus.lineAccepted': admin.firestore.FieldValue.delete(),
+      'pairingStatus.partnerLineUserId': partnerLineUserId
     });
 
     tx.delete(codeRef);
