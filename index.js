@@ -25,10 +25,16 @@ const FCM_FAIL_THRESHOLD = Number(process.env.FCM_FAIL_THRESHOLD || 3);
 // ===== Firebase Admin =====
 let db = null;
 async function initAsync() {
-  if (admin.apps.length) { db = admin.firestore(); return; }
+  if (admin.apps.length) {
+    db = admin.firestore();
+    return;
+  }
   const sa = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (sa) admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
-  else admin.initializeApp();
+  if (sa) {
+    admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
+  } else {
+    admin.initializeApp();
+  }
   db = admin.firestore();
   console.log('[init] Firestore handle obtained');
 }
@@ -76,15 +82,28 @@ const hours = (n) => n * 60 * 60 * 1000;
 function formatTs(ts) {
   const d = (ts && typeof ts.toDate === 'function') ? ts.toDate() : ts;
   const dateTimeString = d.toLocaleString('ja-JP', {
-    timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hour12: false
+    timeZone: 'Asia/Tokyo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
   });
   return dateTimeString.replace(/\//g, '-').replace(' ', '-');
 }
-function shortId(uuid) { return uuid.replace(/-/g, '').slice(0, 6).toUpperCase(); }
-function makeDocId(formattedTsStr, uuid) { return `${formattedTsStr}-${shortId(uuid)}`; }
-function genCode() { return String(Math.floor(Math.random() * 90000) + 10000); } // 5桁数字
-function reply(replyToken, text) { return client.replyMessage(replyToken, { type: 'text', text }); }
+function shortId(uuid) {
+  return uuid.replace(/-/g, '').slice(0, 6).toUpperCase();
+}
+function makeDocId(formattedTsStr, uuid) {
+  return `${formattedTsStr}-${shortId(uuid)}`;
+}
+function genCode() {
+  return String(Math.floor(Math.random() * 90000) + 10000); // 5桁数字
+}
+function reply(replyToken, text) {
+  return client.replyMessage(replyToken, { type: 'text', text });
+}
 
 // ============================================================
 //  ペアリング（アプリ主導）: pairingCodes コレクション方式
@@ -117,9 +136,12 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
     });
 
     // UX用メタ（表示）
-    await dbx.collection('users').doc(uid).set({
-      pairingStatus: { status: 'waiting', code, expiresAt }
-    }, { merge: true });
+    await dbx.collection('users').doc(uid).set(
+      {
+        pairingStatus: { status: 'waiting', code, expiresAt }
+      },
+      { merge: true }
+    );
 
     res.json({ code, expiresAt: Math.floor(expiresAtMs / 1000) });
   } catch (e) {
@@ -147,21 +169,23 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
       const expMs = expiresAt?.toMillis?.() ?? 0;
       if (!expMs || Date.now() > expMs) throw new Error('expired');
 
-      const actorRef = dbx.collection('users').doc(ownerUid);   // A
+      const actorRef = dbx.collection('users').doc(ownerUid); // A
       const partnerRef = dbx.collection('users').doc(partnerUid); // B
 
       const [aSnap, pSnap] = await Promise.all([tx.get(actorRef), tx.get(partnerRef)]);
       const a = aSnap.data()?.pairingStatus || {};
       const p = pSnap.data()?.pairingStatus || {};
 
-      if (a.status === 'paired' && a.partnerUid && a.partnerUid !== partnerUid) throw new Error('actor_already_paired');
-      if (p.status === 'paired' && p.partnerUid && p.partnerUid !== ownerUid) throw new Error('partner_already_paired');
+      if (a.status === 'paired' && a.partnerUid && a.partnerUid !== partnerUid)
+        throw new Error('actor_already_paired');
+      if (p.status === 'paired' && p.partnerUid && p.partnerUid !== ownerUid)
+        throw new Error('partner_already_paired');
 
       // まず存在を保証（ドキュメントが無い場合でも update が通るように）
       tx.set(actorRef, { pairingStatus: {} }, { merge: true });
       tx.set(partnerRef, { pairingStatus: {} }, { merge: true });
 
-      // 対称に確定（pairedAt は保存しない）— 不要フィールドの delete は行わない
+      // 対称に確定（pairedAt は保存しない）
       tx.update(actorRef, {
         'pairingStatus.status': 'paired',
         'pairingStatus.partnerUid': partnerUid
@@ -180,8 +204,11 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
   } catch (e) {
     const msg = String(e.message || e);
     const status =
-      /invalid|bad code|expired|self_pair/i.test(msg) ? 400 :
-      /actor_already_paired|partner_already_paired/i.test(msg) ? 409 : 500;
+      /invalid|bad code|expired|self_pair/i.test(msg)
+        ? 400
+        : /actor_already_paired|partner_already_paired/i.test(msg)
+        ? 409
+        : 500;
     console.error('[pair/accept] failed:', msg);
     res.status(status).json({ message: msg });
   }
@@ -189,8 +216,9 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
 
 // ============================================================
 //  LINE でコード入力 → その場で確定（paired、冪等）
+//  partnerLineUserId は使わず、partnerUid に統合して保存
 // ============================================================
-async function finalizePairingByLine(code, partnerLineUserId) {
+async function finalizePairingByLine(code, partnerUidFromLine) {
   const dbx = getDb();
   const codeRef = dbx.collection('pairingCodes').doc(code);
 
@@ -204,27 +232,18 @@ async function finalizePairingByLine(code, partnerLineUserId) {
     if (!expMs || Date.now() > expMs) throw new Error('expired');
 
     const actorRef = dbx.collection('users').doc(ownerUid);
-    const actorSnap = await tx.get(actorRef);
-    const current = actorSnap.data()?.pairingStatus || {};
 
-    // まず存在を保証
-    tx.set(actorRef, { pairingStatus: {} }, { merge: true });
-
-    // 既に paired の場合は冪等：partnerLineUserId だけ補完
-    if (current.status === 'paired') {
-      tx.update(actorRef, {
-        'pairingStatus.partnerLineUserId': current.partnerLineUserId || partnerLineUserId || null
-      });
-      tx.delete(codeRef);
-      return;
-    }
-
-    // owner 側を確定（pairedAt は保存しない）
-    tx.update(actorRef, {
-      'pairingStatus.status': 'paired',
-      'pairingStatus.partnerUid': current.partnerUid || null,
-      'pairingStatus.partnerLineUserId': partnerLineUserId
-    });
+    // pairingStatus を partnerUid のみに統一（LINEの userId をそのまま入れる）
+    tx.set(
+      actorRef,
+      {
+        pairingStatus: {
+          status: 'paired',
+          partnerUid: partnerUidFromLine
+        }
+      },
+      { merge: true }
+    );
 
     tx.delete(codeRef);
   });
@@ -248,7 +267,7 @@ async function handleEvent(event) {
     // 1) 5桁コード or "pair XXXXX"
     if (event.type === 'message' && event.message?.type === 'text' && event.source?.userId) {
       const text = (event.message.text || '').trim();
-      const partnerLineUserId = event.source.userId;
+      const partnerLineUserId = event.source.userId; // ここは LINE userId
       let pairingCode = null;
 
       if (/^\d{5}$/.test(text)) pairingCode = text;
@@ -280,13 +299,28 @@ async function handleEvent(event) {
         const appUserUid = ap[1];
         try {
           const userRef = getDb().collection('users').doc(appUserUid);
-          await userRef.update({ 'blockStatus.isActive': false, 'blockStatus.activatedAt': null });
-          if (event.source?.userId) await client.pushMessage(event.source.userId, { type: 'text', text: '承認しました。' });
-        } catch (err) { console.error('[webhook/approve] failed:', err); }
+          await userRef.update({
+            'blockStatus.isActive': false,
+            'blockStatus.activatedAt': null
+          });
+          if (event.source?.userId) {
+            await client.pushMessage(event.source.userId, {
+              type: 'text',
+              text: '承認しました。'
+            });
+          }
+        } catch (err) {
+          console.error('[webhook/approve] failed:', err);
+        }
         return;
       }
       if (rj) {
-        if (event.source?.userId) await client.pushMessage(event.source.userId, { type: 'text', text: '解除申請を拒否しました。' });
+        if (event.source?.userId) {
+          await client.pushMessage(event.source.userId, {
+            type: 'text',
+            text: '解除申請を拒否しました。'
+          });
+        }
         return;
       }
     }
@@ -303,22 +337,28 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
   const email = req.auth.email;
   const dbx = getDb();
   try {
+    // テストユーザは即解除
     if (email === 'nomorebettest@gmail.com') {
       const userRef = dbx.collection('users').doc(uid);
-      await userRef.update({ 'blockStatus.isActive': false, 'blockStatus.activatedAt': null });
+      await userRef.update({
+        'blockStatus.isActive': false,
+        'blockStatus.activatedAt': null
+      });
       console.log(`[test-unlock] Auto-unlocked: user=${uid}`);
       return res.json({ ok: true, message: 'Auto-unlocked for test user.' });
     }
+
     const userRef = dbx.collection('users').doc(uid);
     const userSnap = await userRef.get();
     if (!userSnap.exists) return res.status(404).json({ error: 'User not found' });
 
     const pairingStatus = userSnap.data().pairingStatus || {};
-    const partnerLineUserId = pairingStatus.partnerLineUserId;
-    if (!partnerLineUserId || pairingStatus.status !== 'paired') {
+    const partnerUid = pairingStatus.partnerUid; // ★ ここを統一
+    if (!partnerUid || pairingStatus.status !== 'paired') {
       return res.status(400).json({ error: 'Partner is not configured.' });
     }
-    await client.pushMessage(partnerLineUserId, {
+
+    await client.pushMessage(partnerUid, {
       type: 'template',
       altText: '解除申請が届きました',
       template: {
@@ -326,10 +366,11 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
         text: 'パートナーからブロック解除の申請が届きました。承認しますか？',
         actions: [
           { type: 'postback', label: '承認する', data: `approve:${uid}` },
-          { type: 'postback', label: '拒否する', data: `reject:${uid}` },
-        ],
-      },
+          { type: 'postback', label: '拒否する', data: `reject:${uid}` }
+        ]
+      }
     });
+
     res.json({ ok: true });
   } catch (e) {
     console.error('[request-partner-unlock] failed:', e);
@@ -346,13 +387,13 @@ app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
     if (!userSnap.exists) return res.status(404).json({ error: 'User not found' });
 
     const pairingStatus = userSnap.data().pairingStatus || {};
-    const partnerLineUserId = pairingStatus.partnerLineUserId;
-    if (partnerLineUserId && pairingStatus.status === 'paired') {
-      await client.pushMessage(partnerLineUserId, {
+    const partnerUid = pairingStatus.partnerUid; // ★ 統一
+    if (partnerUid && pairingStatus.status === 'paired') {
+      await client.pushMessage(partnerUid, {
         type: 'text',
         text: '【nomoreBET お知らせ】\nパートナーが強制解除機能を使用しました。'
       });
-      console.log(`[force-unlock] 通知送信: user=${uid}, partner=${partnerLineUserId}`);
+      console.log(`[force-unlock] 通知送信: user=${uid}, partner=${partnerUid}`);
     }
     res.json({ ok: true });
   } catch (e) {
@@ -366,7 +407,9 @@ app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
   try {
     const userRef = getDb().collection('users').doc(uid);
-    await userRef.update({ 'heartbeat.lastHeartbeat': admin.firestore.FieldValue.serverTimestamp() });
+    await userRef.update({
+      'heartbeat.lastHeartbeat': admin.firestore.FieldValue.serverTimestamp()
+    });
     res.json({ ok: true });
   } catch (e) {
     console.error(`[heartbeat] failed for user ${uid}`, e);
@@ -395,15 +438,26 @@ app.post('/ack-ping', async (req, res) => {
       return res.status(403).json({ error: 'Unauthorized: Invalid device token' });
     }
 
-    const q = await userRef.collection('pendingPings').where('id', '==', pingId).limit(1).get();
+    const q = await userRef
+      .collection('pendingPings')
+      .where('id', '==', pingId)
+      .limit(1)
+      .get();
     if (q.empty) return res.json({ ok: true, message: 'not found' });
     const snap = q.docs[0];
     const data = snap.data();
     if (data.status !== 'waiting') return res.json({ ok: true, message: `ignored (${data.status})` });
 
-    const deadlineMs = (data.expiresAt?.toMillis?.() ?? (data.sentAt?.toMillis?.() + PING_ACK_WINDOW_MS));
-    const newStatus = (Date.now() <= deadlineMs) ? 'replied' : 'replied_late';
-    await snap.ref.set({ status: newStatus, repliedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    const deadlineMs =
+      data.expiresAt?.toMillis?.() ?? data.sentAt?.toMillis?.() + PING_ACK_WINDOW_MS;
+    const newStatus = Date.now() <= deadlineMs ? 'replied' : 'replied_late';
+    await snap.ref.set(
+      {
+        status: newStatus,
+        repliedAt: admin.firestore.FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
     res.json({ ok: true });
   } catch (e) {
     console.error('[ack-ping] failed', e);
@@ -420,8 +474,12 @@ app.get('/cron/check-heartbeats', async (req, res) => {
 
   const dbx = getDb();
   const nowTs = admin.firestore.Timestamp.now();
-  const staleCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - minutes(STALE_MINUTES));
-  const longOfflineCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - minutes(LONG_OFFLINE_MIN));
+  const staleCutoff = admin.firestore.Timestamp.fromMillis(
+    nowTs.toMillis() - minutes(STALE_MINUTES)
+  );
+  const longOfflineCutoff = admin.firestore.Timestamp.fromMillis(
+    nowTs.toMillis() - minutes(LONG_OFFLINE_MIN)
+  );
 
   try {
     // 1) waiting期限切れ
@@ -429,9 +487,10 @@ app.get('/cron/check-heartbeats', async (req, res) => {
     for (const userDoc of allUsers.docs) {
       const userRef = userDoc.ref;
       const pairingStatus = userDoc.data()?.pairingStatus || {};
-      const partnerLineUserId = pairingStatus.partnerLineUserId;
+      const partnerUid = pairingStatus.partnerUid; // ★ 統一
 
-      const overdue = await userRef.collection('pendingPings')
+      const overdue = await userRef
+        .collection('pendingPings')
         .where('status', '==', 'waiting')
         .where('expiresAt', '<', nowTs)
         .get();
@@ -439,19 +498,27 @@ app.get('/cron/check-heartbeats', async (req, res) => {
       if (!overdue.empty) {
         const batch = dbx.batch();
         for (const ping of overdue.docs) {
-          batch.set(ping.ref, { status: 'expired', expiredAt: nowTs }, { merge: true });
+          batch.set(
+            ping.ref,
+            { status: 'expired', expiredAt: nowTs },
+            { merge: true }
+          );
 
-          if (partnerLineUserId) {
+          if (partnerUid) {
             const sentAt = ping.data().sentAt;
             let timeString = '一定時間';
             if (sentAt) {
               const date = sentAt.toDate();
               timeString = new Intl.DateTimeFormat('ja-JP', {
-                month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Tokyo'
+                month: 'numeric',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                timeZone: 'Asia/Tokyo'
               }).format(date);
             }
             try {
-              await client.pushMessage(partnerLineUserId, {
+              await client.pushMessage(partnerUid, {
                 type: 'text',
                 text:
                   `【nomoreBET お知らせ】\n` +
@@ -459,7 +526,9 @@ app.get('/cron/check-heartbeats', async (req, res) => {
                   `${timeString}ごろ、ブロック機能が一時的に無効になっていた可能性があります。パートナーの方にご確認ください。\n\n` +
                   `※端末の電源OFF、圏外、設定変更などが原因の場合もあります。`
               });
-            } catch (e) { console.error('[cron] LINE push error:', e); }
+            } catch (e) {
+              console.error('[cron] LINE push error:', e);
+            }
           }
         }
         await batch.commit();
@@ -468,7 +537,8 @@ app.get('/cron/check-heartbeats', async (req, res) => {
     }
 
     // 2) stale への ping（heartbeat.lastHeartbeat を参照）
-    const q = await dbx.collection('users')
+    const q = await dbx
+      .collection('users')
       .where('blockStatus.isActive', '==', true)
       .where('heartbeat.lastHeartbeat', '<', staleCutoff)
       .where('heartbeat.lastHeartbeat', '>', longOfflineCutoff)
@@ -480,38 +550,54 @@ app.get('/cron/check-heartbeats', async (req, res) => {
       const uid = userDoc.id;
       const userRef = userDoc.ref;
       const fcmToken = userDoc.data().deviceStatus?.fcmToken;
-      if (!fcmToken) { console.warn('[cron] skip (no fcmToken)', uid); continue; }
+      if (!fcmToken) {
+        console.warn('[cron] skip (no fcmToken)', uid);
+        continue;
+      }
 
-      const waitingExists = await userRef.collection('pendingPings')
+      const waitingExists = await userRef
+        .collection('pendingPings')
         .where('status', '==', 'waiting')
         .limit(1)
         .get();
-      if (!waitingExists.empty) { console.log('[cron] skip (waiting exists)', uid); continue; }
+      if (!waitingExists.empty) {
+        console.log('[cron] skip (waiting exists)', uid);
+        continue;
+      }
 
       const pingUuid = crypto.randomUUID();
       const japanFormattedNow = formatTs(nowTs);
       const docId = makeDocId(japanFormattedNow, pingUuid);
-      const expiresAt = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() + PING_ACK_WINDOW_MS);
+      const expiresAt = admin.firestore.Timestamp.fromMillis(
+        nowTs.toMillis() + PING_ACK_WINDOW_MS
+      );
 
       await userRef.collection('pendingPings').doc(docId).set({
-        id: pingUuid, readableId: docId, status: 'waiting',
-        sentAt: nowTs, expiresAt, by: 'cron'
+        id: pingUuid,
+        readableId: docId,
+        status: 'waiting',
+        sentAt: nowTs,
+        expiresAt,
+        by: 'cron'
       });
 
       try {
         await admin.messaging().send({
           token: fcmToken,
           data: { action: 'ping_challenge', pingId: pingUuid, uid },
-          android: { priority: 'high', ttl: PING_TTL_MS },
+          android: { priority: 'high', ttl: PING_TTL_MS }
         });
 
-        await userRef.set({
-          deviceStatus: {
-            lastFcmOkAt: admin.firestore.FieldValue.serverTimestamp(),
-            fcmConsecutiveFails: 0,
-            gmsIssueSuspected: false
-          }
-        }, { merge: true });
+        await userRef.set(
+          {
+            deviceStatus: {
+              lastFcmOkAt: admin.firestore.FieldValue.serverTimestamp(),
+              fcmConsecutiveFails: 0,
+              gmsIssueSuspected: false
+            }
+          },
+          { merge: true }
+        );
 
         console.log('[cron] ping queued', { uid, pingUuid, docId });
       } catch (sendErr) {
@@ -520,53 +606,81 @@ app.get('/cron/check-heartbeats', async (req, res) => {
 
         try {
           await userRef.collection('fcmSendLogs').add({
-            token: fcmToken, code, message: sendErr?.message || '',
+            token: fcmToken,
+            code,
+            message: sendErr?.message || '',
             at: admin.firestore.FieldValue.serverTimestamp()
           });
-        } catch (logErr) { console.error('[cron] fcmSendLogs add error:', logErr); }
+        } catch (logErr) {
+          console.error('[cron] fcmSendLogs add error:', logErr);
+        }
 
         if (code === 'messaging/registration-token-not-registered') {
-          await userRef.set({
-            deviceStatus: {
-              fcmToken: admin.firestore.FieldValue.delete(),
-              fcmConsecutiveFails: admin.firestore.FieldValue.increment(1),
-              gmsIssueSuspected: false
-            }
-          }, { merge: true });
+          await userRef.set(
+            {
+              deviceStatus: {
+                fcmToken: admin.firestore.FieldValue.delete(),
+                fcmConsecutiveFails: admin.firestore.FieldValue.increment(1),
+                gmsIssueSuspected: false
+              }
+            },
+            { merge: true }
+          );
         } else {
-          await userRef.set({
-            deviceStatus: { fcmConsecutiveFails: admin.firestore.FieldValue.increment(1) }
-          }, { merge: true });
+          await userRef.set(
+            {
+              deviceStatus: {
+                fcmConsecutiveFails: admin.firestore.FieldValue.increment(1)
+              }
+            },
+            { merge: true }
+          );
         }
 
         try {
           const fresh = await userRef.get();
           const dev = fresh.data()?.deviceStatus || {};
           if ((dev.fcmConsecutiveFails || 0) >= FCM_FAIL_THRESHOLD) {
-            await userRef.set({ deviceStatus: { gmsIssueSuspected: true } }, { merge: true });
+            await userRef.set(
+              { deviceStatus: { gmsIssueSuspected: true } },
+              { merge: true }
+            );
           }
-        } catch (readErr) { console.error('[cron] read-after-fail error:', readErr); }
+        } catch (readErr) {
+          console.error('[cron] read-after-fail error:', readErr);
+        }
       }
     }
 
     // 3) 古い ping の掃除（48h）
     try {
-      const cleanupCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - hours(48));
+      const cleanupCutoff = admin.firestore.Timestamp.fromMillis(
+        nowTs.toMillis() - hours(48)
+      );
       const allUsers2 = await dbx.collection('users').get();
       for (const userDoc of allUsers2.docs) {
-        const old = await userDoc.ref.collection('pendingPings').where('sentAt', '<', cleanupCutoff).get();
+        const old = await userDoc.ref
+          .collection('pendingPings')
+          .where('sentAt', '<', cleanupCutoff)
+          .get();
         if (!old.empty) {
           const batch = dbx.batch();
-          old.docs.forEach(doc => batch.delete(doc.ref));
+          old.docs.forEach((doc) => batch.delete(doc.ref));
           await batch.commit();
-          console.log(`[cron-cleanup] cleaned old pings: user=${userDoc.id}, count=${old.size}`);
+          console.log(
+            `[cron-cleanup] cleaned old pings: user=${userDoc.id}, count=${old.size}`
+          );
         }
       }
-    } catch (e) { console.error('[cron-cleanup] failed', e); }
+    } catch (e) {
+      console.error('[cron-cleanup] failed', e);
+    }
 
     // 4) 古い heartbeat_logs の掃除（2日＝48h）
     try {
-      const hbCutoffTs = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - hours(48));
+      const hbCutoffTs = admin.firestore.Timestamp.fromMillis(
+        nowTs.toMillis() - hours(48)
+      );
       const hbCutoffMs = hbCutoffTs.toMillis();
 
       const allUsersForHB = await dbx.collection('users').get();
@@ -581,12 +695,17 @@ app.get('/cron/check-heartbeats', async (req, res) => {
         for (const d of oldByTimestamp.docs) writer.delete(d.ref);
 
         // case B: executedAt(Number ms) を基準に削除
-        const oldByExecutedAt = await hbCol.where('executedAt', '<', hbCutoffMs).get();
+        const oldByExecutedAt = await hbCol
+          .where('executedAt', '<', hbCutoffMs)
+          .get();
         for (const d of oldByExecutedAt.docs) writer.delete(d.ref);
       }
 
       await writer.close();
-      console.log('[cron-cleanup] cleaned old heartbeat_logs up to', hbCutoffTs.toDate().toISOString());
+      console.log(
+        '[cron-cleanup] cleaned old heartbeat_logs up to',
+        hbCutoffTs.toDate().toISOString()
+      );
     } catch (e) {
       console.error('[cron-cleanup-heartbeats] failed', e);
     }
@@ -602,7 +721,8 @@ app.get('/cron/check-heartbeats', async (req, res) => {
 app.get('/probe/check', (req, res) => {
   if (!PROBE_SECRET) return res.status(500).json({ error: 'PROBE_SECRET not set' });
   const nonce = String(req.query.nonce || '');
-  if (!/^[A-Za-z0-9._~\-]{8,128}$/.test(nonce)) return res.status(400).json({ error: 'bad nonce' });
+  if (!/^[A-Za-z0-9._~\-]{8,128}$/.test(nonce))
+    return res.status(400).json({ error: 'bad nonce' });
   const sig = crypto.createHmac('sha256', PROBE_SECRET).update(nonce, 'utf8').digest('base64');
   res.set('Cache-Control', 'no-store');
   res.json({ alg: 'HS256', sig });
@@ -619,7 +739,8 @@ app.post('/partner/approve-unlock-app', firebaseAuthMiddleware, async (req, res)
     const p = partnerSnap.data()?.pairingStatus || {};
     if (p.status !== 'paired') return res.status(400).json({ error: 'not paired' });
 
-    const q = await dbx.collection('users')
+    const q = await dbx
+      .collection('users')
       .where('pairingStatus.partnerUid', '==', partnerUid)
       .limit(1)
       .get();
@@ -634,15 +755,18 @@ app.post('/partner/approve-unlock-app', firebaseAuthMiddleware, async (req, res)
       return res.status(403).json({ error: 'pairing mismatch' });
     }
 
-    await individualRef.set({
-      blockStatus: {
-        isActive: false,
-        activatedAt: null
+    await individualRef.set(
+      {
+        blockStatus: {
+          isActive: false,
+          activatedAt: null
+        },
+        heartbeat: {
+          lastHeartbeat: admin.firestore.FieldValue.serverTimestamp()
+        }
       },
-      heartbeat: {
-        lastHeartbeat: admin.firestore.FieldValue.serverTimestamp()
-      }
-    }, { merge: true });
+      { merge: true }
+    );
 
     return res.json({ ok: true, individualUid });
   } catch (e) {
