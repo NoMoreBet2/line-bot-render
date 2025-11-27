@@ -419,7 +419,7 @@ app.post('/pair/unpair', firebaseAuthMiddleware, async (req, res) => {
         }
       }
 
-      // --- ここから write（read はもうしない）---
+      // --- ここから write（read はもうしなｆｆい）---
 
       // 自分側：ペアリング解除 ＋ 解除方法リセット
       tx.set(
