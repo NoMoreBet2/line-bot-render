@@ -378,6 +378,101 @@ app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => 
   }
 });
 
+// ============================================================
+//  ペアリング解除（当事者側から）
+//  - 当事者(uid)の pairingStatus / blockStatus をリセット
+//  - partnerUid がアプリユーザなら、そのユーザの pairingStatus もリセット
+// ============================================================
+// ─────────────────────────────
+// ペアリング解除API（当事者 or パートナーどちらからでもOK）
+// ─────────────────────────────
+app.post('/pair/unpair', firebaseAuthMiddleware, async (req, res) => {
+  try {
+    const uid = req.auth.uid;           // 呼び出した側（当事者 or パートナー）
+    const dbx = getDb();
+
+    await dbx.runTransaction(async (tx) => {
+      const selfRef = dbx.collection('users').doc(uid);
+      const selfSnap = await tx.get(selfRef);
+      if (!selfSnap.exists) {
+        throw new Error('self_not_found');
+      }
+
+      const selfData = selfSnap.data() || {};
+      const selfPair = selfData.pairingStatus || {};
+      if (selfPair.status !== 'paired') {
+        throw new Error('not_paired');
+      }
+
+      const partnerUid = selfPair.partnerUid || null;
+
+      // まず全ての read を済ませる（transaction のルール対応）
+      let partnerRef = null;
+      let partnerSnap = null;
+      let partnerPair = null;
+
+      if (partnerUid) {
+        partnerRef = dbx.collection('users').doc(partnerUid);
+        partnerSnap = await tx.get(partnerRef);
+        if (partnerSnap.exists) {
+          partnerPair = (partnerSnap.data() || {}).pairingStatus || {};
+        }
+      }
+
+      // --- ここから write（read はもうしない）---
+
+      // 自分側：ペアリング解除 ＋ 解除方法リセット
+      tx.set(
+        selfRef,
+        {
+          pairingStatus: {
+            status: 'unpaired',
+            partnerUid: null,
+            authProvider: null,
+            code: null,
+            expiresAt: null
+          },
+          blockStatus: {
+            unlockMethod: null,
+            unlockDays: null,
+            expiresAt: null
+          }
+        },
+        { merge: true }
+      );
+
+      // 相手側が存在していて、かつ相互にペアだった場合のみ、相手も解除
+      if (partnerRef && partnerSnap && partnerSnap.exists) {
+        if (partnerPair && partnerPair.status === 'paired' && partnerPair.partnerUid === uid) {
+          tx.set(
+            partnerRef,
+            {
+              pairingStatus: {
+                status: 'unpaired',
+                partnerUid: null,
+                authProvider: null,
+                code: null,
+                expiresAt: null
+              }
+            },
+            { merge: true }
+          );
+        }
+      }
+    });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[pair/unpair] failed', e);
+    const msg = String(e.message || e);
+    const status =
+      /not_paired|self_not_found/.test(msg) ? 400 : 500;
+    return res.status(status).json({ ok: false, error: msg });
+  }
+});
+
+
+
 // 強制解除の通知API
 app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
