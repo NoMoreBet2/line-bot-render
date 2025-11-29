@@ -149,7 +149,6 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
     res.status(500).json({ error: 'Failed to issue a pair code.' });
   }
 });
-
 app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
   const partnerUid = req.auth.uid; // B
   const code = String(req.body?.code || '').trim();
@@ -181,11 +180,12 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
       if (p.status === 'paired' && p.partnerUid && p.partnerUid !== ownerUid)
         throw new Error('partner_already_paired');
 
-      // まず存在を保証（ドキュメントが無い場合でも update が通るように）
+      // まず存在を保証
       tx.set(actorRef, { pairingStatus: {} }, { merge: true });
       tx.set(partnerRef, { pairingStatus: {} }, { merge: true });
 
-
+      // 🔸 ここで「今の時刻」のフィールド値を1回だけ作る
+      const nowTs = admin.firestore.FieldValue.serverTimestamp();
 
       // A側（actor）
       tx.update(actorRef, {
@@ -207,23 +207,27 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
         'pairingStatus.expiresAt': null
       });
 
-      // ワンタイム消費（これは必須）
+      // ワンタイム消費
       tx.delete(codeRef);
     });
 
     res.json({ ok: true });
   } catch (e) {
+    // 🔸 ここを強化（どんなエラーか丸ごと見る）
+    console.error('[pair/accept] failed raw error:', e);
+
     const msg = String(e.message || e);
     const status =
       /invalid|bad code|expired|self_pair/i.test(msg)
         ? 400
         : /actor_already_paired|partner_already_paired/i.test(msg)
-          ? 409
-          : 500;
+        ? 409
+        : 500;
     console.error('[pair/accept] failed:', msg);
     res.status(status).json({ message: msg });
   }
 });
+
 
 // ============================================================
 //  LINE でコード入力 → その場で確定（paired、冪等）
