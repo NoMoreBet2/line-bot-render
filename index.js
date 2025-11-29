@@ -247,28 +247,24 @@ async function finalizePairingByLine(code, partnerUidFromLine) {
     if (!expMs || Date.now() > expMs) throw new Error('expired');
 
     const actorRef = dbx.collection('users').doc(ownerUid);
+    const nowTs = admin.firestore.FieldValue.serverTimestamp();
 
-    // pairingStatus を partnerUid のみに統一（LINE の userId をそのまま入れる）
     tx.set(
       actorRef,
       {
-        pairingStatus: {
-          status: 'paired',
-          partnerUid: partnerUidFromLine,
-          pairedAt: admin.firestore.FieldValue.serverTimestamp(),
-          // unpairedAt は触らない（最後の解除時刻は残す）
-          code: null,
-          expiresAt: null
-        }
+        'pairingStatus.status': 'paired',
+        'pairingStatus.partnerUid': partnerUidFromLine,
+        'pairingStatus.pairedAt': nowTs,
+        'pairingStatus.code': null,
+        'pairingStatus.expiresAt': null
+        // ★ unpairedAt は何も書かない → 既存があれば残る
       },
       { merge: true }
     );
 
-    // ワンタイムコードを消費
     tx.delete(codeRef);
   });
 
-  // トランザクションが成功したら OK を返す
   return { ok: true };
 }
 
