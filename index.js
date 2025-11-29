@@ -135,13 +135,15 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
       expiresAt
     });
 
-    // UX用メタ（表示）
-    await dbx.collection('users').doc(uid).set(
-      {
-        pairingStatus: { status: 'waiting', code, expiresAt }
-      },
-      { merge: true }
-    );
+   await dbx.collection('users').doc(uid).set(
+  {
+    'pairingStatus.status': 'waiting',
+    'pairingStatus.code': code,
+    'pairingStatus.expiresAt': expiresAt
+  },
+  { merge: true }
+);
+
 
     res.json({ code, expiresAt: Math.floor(expiresAtMs / 1000) });
   } catch (e) {
@@ -149,6 +151,7 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
     res.status(500).json({ error: 'Failed to issue a pair code.' });
   }
 });
+
 app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
   const partnerUid = req.auth.uid; // B
   const code = String(req.body?.code || '').trim();
@@ -168,7 +171,7 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
       const expMs = expiresAt?.toMillis?.() ?? 0;
       if (!expMs || Date.now() > expMs) throw new Error('expired');
 
-      const actorRef = dbx.collection('users').doc(ownerUid); // A
+      const actorRef = dbx.collection('users').doc(ownerUid);   // A
       const partnerRef = dbx.collection('users').doc(partnerUid); // B
 
       const [aSnap, pSnap] = await Promise.all([tx.get(actorRef), tx.get(partnerRef)]);
@@ -180,33 +183,35 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
       if (p.status === 'paired' && p.partnerUid && p.partnerUid !== ownerUid)
         throw new Error('partner_already_paired');
 
-      // まず存在を保証
-      tx.set(actorRef, { pairingStatus: {} }, { merge: true });
-      tx.set(partnerRef, { pairingStatus: {} }, { merge: true });
-
-      // 🔸 ここで「今の時刻」のフィールド値を1回だけ作る
       const nowTs = admin.firestore.FieldValue.serverTimestamp();
 
-    // 🟢 修正後
-// A側（actor）
-      tx.update(actorRef, {
-        'pairingStatus.status': 'paired',
-        'pairingStatus.partnerUid': partnerUid,
-        'pairingStatus.pairedAt': nowTs,
-        // 'pairingStatus.unpairedAt': null,  ← 削除
-        'pairingStatus.code': null,
-        'pairingStatus.expiresAt': null
-      });
+      // A側（actor）
+      tx.set(
+        actorRef,
+        {
+          'pairingStatus.status': 'paired',
+          'pairingStatus.partnerUid': partnerUid,
+          'pairingStatus.pairedAt': nowTs,
+          'pairingStatus.code': null,
+          'pairingStatus.expiresAt': null
+          // ★ unpairedAt は触らない
+        },
+        { merge: true }
+      );
 
-// B側（partner）
-      tx.update(partnerRef, {
-        'pairingStatus.status': 'paired',
-        'pairingStatus.partnerUid': ownerUid,
-        'pairingStatus.pairedAt': nowTs,
-        // 'pairingStatus.unpairedAt': null,  ← 削除
-        'pairingStatus.code': null,
-        'pairingStatus.expiresAt': null
-      });
+      // B側（partner）
+      tx.set(
+        partnerRef,
+        {
+          'pairingStatus.status': 'paired',
+          'pairingStatus.partnerUid': ownerUid,
+          'pairingStatus.pairedAt': nowTs,
+          'pairingStatus.code': null,
+          'pairingStatus.expiresAt': null
+          // ★ unpairedAt は触らない
+        },
+        { merge: true }
+      );
 
       // ワンタイム消費
       tx.delete(codeRef);
@@ -214,7 +219,6 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
 
     res.json({ ok: true });
   } catch (e) {
-    // 🔸 ここを強化（どんなエラーか丸ごと見る）
     console.error('[pair/accept] failed raw error:', e);
 
     const msg = String(e.message || e);
@@ -224,10 +228,12 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
         : /actor_already_paired|partner_already_paired/i.test(msg)
         ? 409
         : 500;
+
     console.error('[pair/accept] failed:', msg);
     res.status(status).json({ message: msg });
   }
 });
+
 
 // ============================================================
 //  LINE でコード入力 → その場で確定（paired、冪等）
