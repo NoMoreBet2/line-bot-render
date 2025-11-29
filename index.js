@@ -185,15 +185,26 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
       tx.set(actorRef, { pairingStatus: {} }, { merge: true });
       tx.set(partnerRef, { pairingStatus: {} }, { merge: true });
 
-      // 対称に確定（pairedAt は保存しない）
+
+
+      // A側（actor）
       tx.update(actorRef, {
         'pairingStatus.status': 'paired',
-        'pairingStatus.partnerUid': partnerUid
+        'pairingStatus.partnerUid': partnerUid,
+        'pairingStatus.pairedAt': nowTs,
+        'pairingStatus.unpairedAt': null,
+        'pairingStatus.code': null,
+        'pairingStatus.expiresAt': null
       });
 
+      // B側（partner）
       tx.update(partnerRef, {
         'pairingStatus.status': 'paired',
-        'pairingStatus.partnerUid': ownerUid
+        'pairingStatus.partnerUid': ownerUid,
+        'pairingStatus.pairedAt': nowTs,
+        'pairingStatus.unpairedAt': null,
+        'pairingStatus.code': null,
+        'pairingStatus.expiresAt': null
       });
 
       // ワンタイム消費（これは必須）
@@ -207,8 +218,8 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
       /invalid|bad code|expired|self_pair/i.test(msg)
         ? 400
         : /actor_already_paired|partner_already_paired/i.test(msg)
-        ? 409
-        : 500;
+          ? 409
+          : 500;
     console.error('[pair/accept] failed:', msg);
     res.status(status).json({ message: msg });
   }
@@ -239,7 +250,11 @@ async function finalizePairingByLine(code, partnerUidFromLine) {
       {
         pairingStatus: {
           status: 'paired',
-          partnerUid: partnerUidFromLine
+          partnerUid: partnerUidFromLine,
+          pairedAt: admin.firestore.FieldValue.serverTimestamp(),
+          unpairedAt: null,
+          code: null,
+          expiresAt: null
         }
       },
       { merge: true }
