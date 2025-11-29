@@ -187,22 +187,23 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
       // 🔸 ここで「今の時刻」のフィールド値を1回だけ作る
       const nowTs = admin.firestore.FieldValue.serverTimestamp();
 
-      // A側（actor）
+    // 🟢 修正後
+// A側（actor）
       tx.update(actorRef, {
         'pairingStatus.status': 'paired',
         'pairingStatus.partnerUid': partnerUid,
         'pairingStatus.pairedAt': nowTs,
-        'pairingStatus.unpairedAt': null,
+        // 'pairingStatus.unpairedAt': null,  ← 削除
         'pairingStatus.code': null,
         'pairingStatus.expiresAt': null
       });
 
-      // B側（partner）
+// B側（partner）
       tx.update(partnerRef, {
         'pairingStatus.status': 'paired',
         'pairingStatus.partnerUid': ownerUid,
         'pairingStatus.pairedAt': nowTs,
-        'pairingStatus.unpairedAt': null,
+        // 'pairingStatus.unpairedAt': null,  ← 削除
         'pairingStatus.code': null,
         'pairingStatus.expiresAt': null
       });
@@ -249,6 +250,7 @@ async function finalizePairingByLine(code, partnerUidFromLine) {
     const actorRef = dbx.collection('users').doc(ownerUid);
 
     // pairingStatus を partnerUid のみに統一（LINEの userId をそのまま入れる）
+   // 🟢 修正後
     tx.set(
       actorRef,
       {
@@ -256,7 +258,7 @@ async function finalizePairingByLine(code, partnerUidFromLine) {
           status: 'paired',
           partnerUid: partnerUidFromLine,
           pairedAt: admin.firestore.FieldValue.serverTimestamp(),
-          unpairedAt: null,
+          // unpairedAt: null,  ← 削除
           code: null,
           expiresAt: null
         }
@@ -264,8 +266,6 @@ async function finalizePairingByLine(code, partnerUidFromLine) {
       { merge: true }
     );
 
-    tx.delete(codeRef);
-  });
 
   return { ok: true };
 }
@@ -410,7 +410,7 @@ app.post('/pair/unpair', firebaseAuthMiddleware, async (req, res) => {
     const uid = req.auth.uid;           // 呼び出した側（当事者 or パートナー）
     const dbx = getDb();
 
-    await dbx.runTransaction(async (tx) => {
+      await dbx.runTransaction(async (tx) => {
       const selfRef = dbx.collection('users').doc(uid);
       const selfSnap = await tx.get(selfRef);
       if (!selfSnap.exists) {
@@ -425,7 +425,10 @@ app.post('/pair/unpair', firebaseAuthMiddleware, async (req, res) => {
 
       const partnerUid = selfPair.partnerUid || null;
 
-      // まず全ての read を済ませる（transaction のルール対応）
+      // 解除時刻（両者共通でOK）
+      const nowTs = admin.firestore.FieldValue.serverTimestamp();
+
+      // まず全て read
       let partnerRef = null;
       let partnerSnap = null;
       let partnerPair = null;
@@ -438,47 +441,37 @@ app.post('/pair/unpair', firebaseAuthMiddleware, async (req, res) => {
         }
       }
 
-      // --- ここから write（read はもうしなｆｆい）---
+      // --- ここから write ---
 
-      // 自分側：ペアリング解除 ＋ 解除方法リセット
-      tx.set(
-        selfRef,
-        {
-          pairingStatus: {
-            status: 'unpaired',
-            partnerUid: null,
-            authProvider: null,
-            code: null,
-            expiresAt: null
-          },
-          blockStatus: {
-            unlockMethod: null,
-            unlockDays: null,
-            expiresAt: null
-          }
-        },
-        { merge: true }
-      );
+      // 自分側：ステータスだけ更新、pairedAt は触らず unpairedAt を更新
+      tx.update(selfRef, {
+        'pairingStatus.status': 'unpaired',
+        'pairingStatus.partnerUid': null,
+        'pairingStatus.authProvider': null,
+        'pairingStatus.code': null,
+        'pairingStatus.expiresAt': null,
+        'pairingStatus.unpairedAt': nowTs,        // ★ 解除時刻を記録
 
-      // 相手側が存在していて、かつ相互にペアだった場合のみ、相手も解除
+        'blockStatus.unlockMethod': null,
+        'blockStatus.unlockDays': null,
+        'blockStatus.expiresAt': null
+      });
+
+      // 相手側が相互ペアなら同様に解除（pairedAt は触らない）
       if (partnerRef && partnerSnap && partnerSnap.exists) {
         if (partnerPair && partnerPair.status === 'paired' && partnerPair.partnerUid === uid) {
-          tx.set(
-            partnerRef,
-            {
-              pairingStatus: {
-                status: 'unpaired',
-                partnerUid: null,
-                authProvider: null,
-                code: null,
-                expiresAt: null
-              }
-            },
-            { merge: true }
-          );
+          tx.update(partnerRef, {
+            'pairingStatus.status': 'unpaired',
+            'pairingStatus.partnerUid': null,
+            'pairingStatus.authProvider': null,
+            'pairingStatus.code': null,
+            'pairingStatus.expiresAt': null,
+            'pairingStatus.unpairedAt': nowTs   // ★ 相手側にも解除時刻
+          });
         }
       }
     });
+
 
     return res.json({ ok: true });
   } catch (e) {
