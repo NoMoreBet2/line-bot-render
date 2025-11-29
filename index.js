@@ -239,8 +239,8 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
       /invalid|bad code|expired|self_pair/i.test(msg)
         ? 400
         : /actor_already_paired|partner_already_paired/i.test(msg)
-        ? 409
-        : 500;
+          ? 409
+          : 500;
 
     console.error('[pair/accept] failed:', msg);
     res.status(status).json({ message: msg });
@@ -435,7 +435,7 @@ app.post('/pair/unpair', firebaseAuthMiddleware, async (req, res) => {
     const uid = req.auth.uid;           // 呼び出した側（当事者 or パートナー）
     const dbx = getDb();
 
-      await dbx.runTransaction(async (tx) => {
+    await dbx.runTransaction(async (tx) => {
       const selfRef = dbx.collection('users').doc(uid);
       const selfSnap = await tx.get(selfRef);
       if (!selfSnap.exists) {
@@ -468,33 +468,61 @@ app.post('/pair/unpair', firebaseAuthMiddleware, async (req, res) => {
 
       // --- ここから write ---
 
-      // 自分側：ステータスだけ更新、pairedAt は触らず unpairedAt を更新
-      tx.update(selfRef, {
-        'pairingStatus.status': 'unpaired',
-        'pairingStatus.partnerUid': null,
-        'pairingStatus.authProvider': null,
-        'pairingStatus.code': null,
-        'pairingStatus.expiresAt': null,
-        'pairingStatus.unpairedAt': nowTs,        // ★ 解除時刻を記録
+      // --- ここから write ---
 
-        'blockStatus.unlockMethod': null,
-        'blockStatus.unlockDays': null,
-        'blockStatus.expiresAt': null
-      });
+      // 既存の blockStatus も読み出しておく
+      const selfBlock = selfData.blockStatus || {};
 
-      // 相手側が相互ペアなら同様に解除（pairedAt は触らない）
+      // 自分側: pairingStatus / blockStatus をマップごと更新
+      const newSelfPair = {
+        ...selfPair,
+        status: 'unpaired',
+        partnerUid: null,
+        authProvider: null,
+        code: null,
+        expiresAt: null,
+        unpairedAt: nowTs
+      };
+
+      const newSelfBlock = {
+        ...selfBlock,
+        unlockMethod: null,
+        unlockDays: null,
+        expiresAt: null
+      };
+
+      tx.set(
+        selfRef,
+        {
+          pairingStatus: newSelfPair,
+          blockStatus: newSelfBlock
+        },
+        { merge: true }
+      );
+
+      // 相手側が相互ペアなら同様に解除
       if (partnerRef && partnerSnap && partnerSnap.exists) {
         if (partnerPair && partnerPair.status === 'paired' && partnerPair.partnerUid === uid) {
-          tx.update(partnerRef, {
-            'pairingStatus.status': 'unpaired',
-            'pairingStatus.partnerUid': null,
-            'pairingStatus.authProvider': null,
-            'pairingStatus.code': null,
-            'pairingStatus.expiresAt': null,
-            'pairingStatus.unpairedAt': nowTs   // ★ 相手側にも解除時刻
-          });
+          const newPartnerPair = {
+            ...partnerPair,
+            status: 'unpaired',
+            partnerUid: null,
+            authProvider: null,
+            code: null,
+            expiresAt: null,
+            unpairedAt: nowTs
+          };
+
+          tx.set(
+            partnerRef,
+            { pairingStatus: newPartnerPair },
+            { merge: true }
+          );
         }
       }
+
+
+
     });
 
 
