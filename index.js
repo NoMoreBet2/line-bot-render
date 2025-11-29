@@ -229,7 +229,6 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
   }
 });
 
-
 // ============================================================
 //  LINE でコード入力 → その場で確定（paired、冪等）
 //  partnerLineUserId は使わず、partnerUid に統合して保存
@@ -249,8 +248,7 @@ async function finalizePairingByLine(code, partnerUidFromLine) {
 
     const actorRef = dbx.collection('users').doc(ownerUid);
 
-    // pairingStatus を partnerUid のみに統一（LINEの userId をそのまま入れる）
-   // 🟢 修正後
+    // pairingStatus を partnerUid のみに統一（LINE の userId をそのまま入れる）
     tx.set(
       actorRef,
       {
@@ -258,7 +256,7 @@ async function finalizePairingByLine(code, partnerUidFromLine) {
           status: 'paired',
           partnerUid: partnerUidFromLine,
           pairedAt: admin.firestore.FieldValue.serverTimestamp(),
-          // unpairedAt: null,  ← 削除
+          // unpairedAt は触らない（最後の解除時刻は残す）
           code: null,
           expiresAt: null
         }
@@ -266,9 +264,14 @@ async function finalizePairingByLine(code, partnerUidFromLine) {
       { merge: true }
     );
 
+    // ワンタイムコードを消費
+    tx.delete(codeRef);
+  });
 
+  // トランザクションが成功したら OK を返す
   return { ok: true };
 }
+
 
 // ===== LINE webhook =====
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
