@@ -135,15 +135,22 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
       expiresAt
     });
 
-   await dbx.collection('users').doc(uid).set(
-  {
-    'pairingStatus.status': 'waiting',
-    'pairingStatus.code': code,
-    'pairingStatus.expiresAt': expiresAt
-  },
-  { merge: true }
-);
+    // users/{uid} の pairingStatus を「マップごと」更新
+    const userRef = dbx.collection('users').doc(uid);
+    const snap = await userRef.get();
+    const currentPair = snap.exists ? (snap.data().pairingStatus || {}) : {};
 
+    await userRef.set(
+      {
+        pairingStatus: {
+          ...currentPair,   // 既存の authProvider / unpairedAt などは維持
+          status: 'waiting',
+          code,
+          expiresAt
+        }
+      },
+      { merge: true }
+    );
 
     res.json({ code, expiresAt: Math.floor(expiresAtMs / 1000) });
   } catch (e) {
@@ -151,6 +158,7 @@ app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
     res.status(500).json({ error: 'Failed to issue a pair code.' });
   }
 });
+
 
 app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
   const partnerUid = req.auth.uid; // B
@@ -185,31 +193,36 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
 
       const nowTs = admin.firestore.FieldValue.serverTimestamp();
 
-      // A側（actor）
+      // ★ A側（actor）の pairingStatus マップを組み立て
+      const newActorPair = {
+        ...a,                     // 既存の authProvider / unpairedAt などを維持
+        status: 'paired',
+        partnerUid,
+        pairedAt: nowTs,
+        code: null,
+        expiresAt: null
+      };
+
+      // ★ B側（partner）の pairingStatus マップ
+      const newPartnerPair = {
+        ...p,                     // こちらも既存フィールドを維持
+        status: 'paired',
+        partnerUid: ownerUid,
+        pairedAt: nowTs,
+        code: null,
+        expiresAt: null
+      };
+
+      // ★ マップごと set する（ドット記法は使わない）
       tx.set(
         actorRef,
-        {
-          'pairingStatus.status': 'paired',
-          'pairingStatus.partnerUid': partnerUid,
-          'pairingStatus.pairedAt': nowTs,
-          'pairingStatus.code': null,
-          'pairingStatus.expiresAt': null
-          // ★ unpairedAt は触らない
-        },
+        { pairingStatus: newActorPair },
         { merge: true }
       );
 
-      // B側（partner）
       tx.set(
         partnerRef,
-        {
-          'pairingStatus.status': 'paired',
-          'pairingStatus.partnerUid': ownerUid,
-          'pairingStatus.pairedAt': nowTs,
-          'pairingStatus.code': null,
-          'pairingStatus.expiresAt': null
-          // ★ unpairedAt は触らない
-        },
+        { pairingStatus: newPartnerPair },
         { merge: true }
       );
 
@@ -235,6 +248,7 @@ app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
 });
 
 
+
 // ============================================================
 //  LINE でコード入力 → その場で確定（paired、冪等）
 //  partnerLineUserId は使わず、partnerUid に統合して保存
@@ -255,16 +269,22 @@ async function finalizePairingByLine(code, partnerUidFromLine) {
     const actorRef = dbx.collection('users').doc(ownerUid);
     const nowTs = admin.firestore.FieldValue.serverTimestamp();
 
+    // 既存 pairingStatus を取り込む
+    const actorSnap = await tx.get(actorRef);
+    const currentPair = actorSnap.exists ? (actorSnap.data().pairingStatus || {}) : {};
+
+    const newPair = {
+      ...currentPair,
+      status: 'paired',
+      partnerUid: partnerUidFromLine,
+      pairedAt: nowTs,
+      code: null,
+      expiresAt: null
+    };
+
     tx.set(
       actorRef,
-      {
-        'pairingStatus.status': 'paired',
-        'pairingStatus.partnerUid': partnerUidFromLine,
-        'pairingStatus.pairedAt': nowTs,
-        'pairingStatus.code': null,
-        'pairingStatus.expiresAt': null
-        // ★ unpairedAt は何も書かない → 既存があれば残る
-      },
+      { pairingStatus: newPair },
       { merge: true }
     );
 
