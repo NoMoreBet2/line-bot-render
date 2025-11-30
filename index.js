@@ -562,14 +562,58 @@ app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
   }
 });
 
-// Heartbeat（※ サーバ側は heartbeat.lastHeartbeat を更新）
+// Heartbeat（※ 修正版：ログ記録とブロック状態の更新を行う）
 app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
   const uid = req.auth.uid;
+  
+  // ★追加: アプリから送られてきたデータを受け取る
+  // Android側で送っているキー名 (isBlockActive, timingType) と合わせます
+  const { isBlockActive, timingType } = req.body || {};
+
   try {
-    const userRef = getDb().collection('users').doc(uid);
-    await userRef.update({
-      'heartbeat.lastHeartbeat': admin.firestore.FieldValue.serverTimestamp()
-    });
+    const dbx = getDb();
+    const userRef = dbx.collection('users').doc(uid);
+    const nowTs = admin.firestore.FieldValue.serverTimestamp();
+
+    // 1. ユーザー情報の更新 (最新状態)
+    // lastHeartbeat の更新に加え、ブロック状態(reportedBlockStatus)も更新します
+    await userRef.set({
+      heartbeat: {
+        lastHeartbeat: nowTs,
+        // アプリから送られてきたブロック状態を記録
+        reportedBlockStatus: isBlockActive === true 
+      }
+    }, { merge: true });
+
+    // 2. ★追加: ログの記録 (Android側で削除した処理をここで代行)
+    // サーバーの正確な時間で記録します
+    const logData = {
+      timestamp: nowTs,          // サーバー時間 (Firestore Timestamp)
+      executedAt: Date.now(),    // 数値のミリ秒 (表示順序用)
+      timingType: timingType || 'unknown',
+      
+      // ブロック状態を boolean で記録
+      blockStatus: isBlockActive === true
+    };
+
+    // ドキュメントID生成 (Androidの "yyyy-MM-dd-HH-mm" 形式に合わせる)
+    // サーバーのロケールに関わらず日本時間でフォーマットします
+    const d = new Date();
+    const docId = d.toLocaleString('ja-JP', { 
+      timeZone: 'Asia/Tokyo',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit'
+    })
+    .replace(/\//g, '-')   // スラッシュをハイフンに
+    .replace(/ /g, '-')    // スペースをハイフンに
+    .replace(/:/g, '-');   // コロンがあればハイフンに
+
+    // heartbeat_logs コレクションに書き込み
+    await userRef.collection('heartbeat_logs').doc(docId).set(logData);
+
     res.json({ ok: true });
   } catch (e) {
     console.error(`[heartbeat] failed for user ${uid}`, e);
