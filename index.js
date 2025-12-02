@@ -742,48 +742,58 @@ app.get('/cron/check-heartbeats', async (req, res) => {
 
     // 2) stale への ping（heartbeat.lastHeartbeat を参照）
     const q = await dbx
-      .collection('users')
-      .where('blockStatus.isActive', '==', true)
-      .where('heartbeat.lastHeartbeat', '<', staleCutoff)
-      .where('heartbeat.lastHeartbeat', '>', longOfflineCutoff)
-      .get();
+  .collection('users')
+  // ★ ブロックON条件は外す（ブロックOFFでも候補にする）
+  .where('heartbeat.lastHeartbeat', '<', staleCutoff)
+  .where('heartbeat.lastHeartbeat', '>', longOfflineCutoff)
+  .get();
+
 
     console.log('[cron] run', { at: new Date().toISOString(), staleCandidates: q.size });
 
-    for (const userDoc of q.docs) {
-      const uid = userDoc.id;
-      const userRef = userDoc.ref;
-      const fcmToken = userDoc.data().deviceStatus?.fcmToken;
-      if (!fcmToken) {
-        console.warn('[cron] skip (no fcmToken)', uid);
-        continue;
-      }
+for (const userDoc of q.docs) {
+  const uid = userDoc.id;
+  const userRef = userDoc.ref;
+  const data = userDoc.data() || {};
 
-      const waitingExists = await userRef
-        .collection('pendingPings')
-        .where('status', '==', 'waiting')
-        .limit(1)
-        .get();
-      if (!waitingExists.empty) {
-        console.log('[cron] skip (waiting exists)', uid);
-        continue;
-      }
+  const fcmToken = data.deviceStatus?.fcmToken;
+  if (!fcmToken) {
+    console.warn('[cron] skip (no fcmToken)', uid);
+    continue;
+  }
 
-      const pingUuid = crypto.randomUUID();
-      const japanFormattedNow = formatTs(nowTs);
-      const docId = makeDocId(japanFormattedNow, pingUuid);
-      const expiresAt = admin.firestore.Timestamp.fromMillis(
-        nowTs.toMillis() + PING_ACK_WINDOW_MS
-      );
+  // ★ 追加：Firestore に保存されている blockStatus をそのまま使う
+  const currentBlockStatus = !!(data.blockStatus && data.blockStatus.isActive);
 
-      await userRef.collection('pendingPings').doc(docId).set({
-        id: pingUuid,
-        readableId: docId,
-        status: 'waiting',
-        sentAt: nowTs,
-        expiresAt,
-        by: 'cron'
-      });
+  // 既存の waiting チェックなどはそのまま
+  const waitingExists = await userRef
+    .collection('pendingPings')
+    .where('status', '==', 'waiting')
+    .limit(1)
+    .get();
+  if (!waitingExists.empty) {
+    console.log('[cron] skip (waiting exists)', uid);
+    continue;
+  }
+
+  const pingUuid = crypto.randomUUID();
+  const japanFormattedNow = formatTs(nowTs);
+  const docId = makeDocId(japanFormattedNow, pingUuid);
+  const expiresAt = admin.firestore.Timestamp.fromMillis(
+    nowTs.toMillis() + PING_ACK_WINDOW_MS
+  );
+
+  await userRef.collection('pendingPings').doc(docId).set({
+    id: pingUuid,
+    readableId: docId,
+    status: 'waiting',
+    sentAt: nowTs,
+    expiresAt,
+    by: 'cron',
+
+    // ★ ここを追加：この ping を発行した時点の Firestore 上のブロック状態
+    blockStatus: currentBlockStatus   // true = 有効, false = 無効 or 未設定
+  });
 
       try {
         await admin.messaging().send({
