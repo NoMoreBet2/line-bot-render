@@ -1,1003 +1,752 @@
 'use strict';
 
-const express = require('express');
-const line = require('@line/bot-sdk');
+const functions = require('firebase-functions');
 const admin = require('firebase-admin');
+const line = require('@line/bot-sdk');
 const crypto = require('crypto');
 
-// ===== Env =====
-const PORT = process.env.PORT || 3000;
-const CRON_SECRET = process.env.CRON_SECRET || '';
-const PROBE_SECRET = process.env.PROBE_SECRET || '';
+// 初期化
+admin.initializeApp();
+const db = admin.firestore();
 
+// ===== 設定 (環境変数) =====
 const lineConfig = {
-  channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
-  channelSecret: process.env.CHANNEL_SECRET,
+  channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN || functions.config().line?.access_token,
+  channelSecret: process.env.CHANNEL_SECRET || functions.config().line?.channel_secret,
 };
 
-// 運用パラメータ
-const STALE_MINUTES = Number(process.env.STALE_MINUTES || 20);
-const LONG_OFFLINE_MIN = Number(process.env.LONG_OFFLINE_MIN || 1440);
-const PING_TTL_MS = Number(process.env.PING_TTL_MS || (2 * 60 * 1000));
-const PING_ACK_WINDOW_MS = Number(process.env.PING_ACK_WINDOW_MS || PING_TTL_MS);
-const FCM_FAIL_THRESHOLD = Number(process.env.FCM_FAIL_THRESHOLD || 3);
+const CRON_SECRET = process.env.CRON_SECRET || functions.config().cron?.secret || '';
+// その他の定数
+const STALE_MINUTES = 20;
+const LONG_OFFLINE_MIN = 1440;
+const PING_TTL_MS = 2 * 60 * 1000;
+const PING_ACK_WINDOW_MS = PING_TTL_MS;
+const FCM_FAIL_THRESHOLD = 3;
 
-// ===== Firebase Admin =====
-let db = null;
-async function initAsync() {
-  if (admin.apps.length) {
-    db = admin.firestore();
-    return;
-  }
-  const sa = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (sa) {
-    admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
-  } else {
-    admin.initializeApp();
-  }
-  db = admin.firestore();
-  console.log('[init] Firestore handle obtained');
-}
-const getDb = () => {
-  if (!db) throw new Error('Firestore not initialized yet');
-  return db;
-};
-
-// ===== Express =====
-const app = express();
-app.get('/', (_, res) => res.send('LINE Bot is running!'));
-app.get('/healthz', (_, res) => res.send('healthy'));
-
-// /webhook は署名検証のため raw を通す（ここでは line.middleware に任せる）
-app.use((req, res, next) => {
-  if (req.path === '/webhook') return next();
-  return express.json()(req, res, next);
-});
-
-// ===== LINE =====
+// LINE Client
 const client = new line.Client(lineConfig);
 
-// ===== Firebase Auth MW =====
-const firebaseAuthMiddleware = async (req, res, next) => {
-  const authHeader = req.headers.authorization || '';
-  if (!authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized: No token provided' });
+// ============================================================
+//  ヘルパー関数
+// ============================================================
+const getUid = (context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError('unauthenticated', 'User must be logged in.');
   }
-  const idToken = authHeader.substring('Bearer '.length);
-  try {
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    req.auth = { uid: decoded.uid, email: decoded.email };
-    next();
-  } catch (error) {
-    console.error('[auth] verifyIdToken error:', error);
-    return res.status(403).json({ error: 'Unauthorized: Invalid token' });
-  }
+  return context.auth.uid;
 };
 
-// ===== Utils =====
 const now = () => Date.now();
 const minutes = (n) => n * 60 * 1000;
-const hours = (n) => n * 60 * 60 * 1000;
 
 function formatTs(ts) {
   const d = (ts && typeof ts.toDate === 'function') ? ts.toDate() : ts;
-  const dateTimeString = d.toLocaleString('ja-JP', {
+  return d.toLocaleString('ja-JP', {
     timeZone: 'Asia/Tokyo',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false
-  });
-  return dateTimeString.replace(/\//g, '-').replace(' ', '-');
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false
+  }).replace(/\//g, '-').replace(' ', '-');
 }
-function shortId(uuid) {
-  return uuid.replace(/-/g, '').slice(0, 6).toUpperCase();
-}
+
 function makeDocId(formattedTsStr, uuid) {
-  return `${formattedTsStr}-${shortId(uuid)}`;
-}
-function genCode() {
-  return String(Math.floor(Math.random() * 90000) + 10000); // 5桁数字
-}
-function reply(replyToken, text) {
-  return client.replyMessage(replyToken, { type: 'text', text });
+  return `${formattedTsStr}-${uuid.replace(/-/g, '').slice(0, 6).toUpperCase()}`;
 }
 
 // ============================================================
-//  ペアリング（アプリ主導）: pairingCodes コレクション方式
+//  1. ユーザー管理・初期化
 // ============================================================
-app.post('/pair/create', firebaseAuthMiddleware, async (req, res) => {
-  const uid = req.auth.uid;
-  const dbx = getDb();
+exports.initializeUser = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const { email, displayName, photoUrl, role } = data;
 
-  // 軽い衝突回避（5桁なので一応）
+  const userRef = db.collection('users').doc(uid);
+  const snap = await userRef.get();
+  const nowTs = admin.firestore.FieldValue.serverTimestamp();
+
+  if (!snap.exists) {
+    // 新規作成
+    await userRef.set({
+      userInfo: {
+        email: email || '',
+        displayName: displayName || '',
+        photoUrl: photoUrl || '',
+        role: role || 'individual',
+        registeredAt: nowTs
+      },
+      blockStatus: {
+        isActive: false,
+        activatedAt: null,
+        deactivatedAt: null,
+        unlockMethod: null,
+        expiresAt: null,
+        unlockDays: null,
+        deactivatedReason: null
+      },
+      heartbeat: { lastHeartbeat: null },
+      pairingStatus: {
+        status: 'unpaired',
+        code: null,
+        partnerUid: null,
+        authProvider: null,
+        expiresAt: null,
+        pairedAt: null,
+        unpairedAt: null
+      },
+      consents: {
+        accessibilityAgreedAt: null,
+        deviceAdminAgreedAt: null,
+        accessibilityRevokedAt: null,
+        deviceAdminRevokedAt: null
+      },
+      deviceStatus: { fcmToken: null }
+    });
+  } else {
+    // 既存更新（重要データは触らない）
+    await userRef.set({
+      userInfo: {
+        email: email || '',
+        displayName: displayName || '',
+        photoUrl: photoUrl || '',
+        role: role || 'individual'
+      }
+    }, { merge: true });
+  }
+  return { success: true };
+});
+
+// ============================================================
+//  2. ブロック状態管理
+// ============================================================
+exports.enableBlocking = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  await db.collection('users').doc(uid).set({
+    blockStatus: {
+      isActive: true,
+      activatedAt: admin.firestore.FieldValue.serverTimestamp()
+    },
+    heartbeat: {
+      lastHeartbeat: admin.firestore.FieldValue.serverTimestamp()
+    }
+  }, { merge: true });
+  return { success: true };
+});
+
+exports.requestUnlock = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const reason = data.reason || 'normal';
+  
+  await db.collection('users').doc(uid).set({
+    blockStatus: {
+      isActive: false,
+      deactivatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      deactivatedReason: reason
+    }
+  }, { merge: true });
+  return { success: true };
+});
+
+exports.setUnlockRule = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const { unlockMethod, unlockDays, expiresAtMs } = data;
+
+  let expiresAt = null;
+  if (expiresAtMs) {
+    expiresAt = admin.firestore.Timestamp.fromMillis(Number(expiresAtMs));
+  }
+
+  const updates = { 'blockStatus.unlockMethod': unlockMethod };
+  if (unlockDays !== undefined && unlockDays !== null) {
+    updates['blockStatus.unlockDays'] = unlockDays;
+  }
+  if (expiresAt !== null) {
+    updates['blockStatus.expiresAt'] = expiresAt;
+    updates['pairingStatus.expiresAt'] = expiresAt;
+  }
+
+  await db.collection('users').doc(uid).update(updates);
+  return { success: true };
+});
+
+exports.updateBlockSettings = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  await db.collection('users').doc(uid).set(
+    { blockStatus: data },
+    { merge: true }
+  );
+  return { success: true };
+});
+
+// ============================================================
+//  3. ペアリング管理
+// ============================================================
+exports.createPairingCode = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const genCode = () => String(Math.floor(Math.random() * 90000) + 10000);
+  
   let code = genCode();
   let tries = 0;
   while (tries < 5) {
-    const ref = dbx.collection('pairingCodes').doc(code);
-    const snap = await ref.get();
+    const snap = await db.collection('pairingCodes').doc(code).get();
     if (!snap.exists) break;
     code = genCode();
     tries++;
   }
-  if (tries >= 5) return res.status(500).json({ error: 'code generation failed' });
+  if (tries >= 5) throw new functions.https.HttpsError('aborted', 'Failed to generate code');
 
-  const expiresAtMs = now() + minutes(30);
+  const expiresAtMs = Date.now() + (30 * 60 * 1000);
   const expiresAt = admin.firestore.Timestamp.fromMillis(expiresAtMs);
 
-  try {
-    // pairingCodes に作成（B側の受け取りで消費）
-    await dbx.collection('pairingCodes').doc(code).set({
-      ownerUid: uid,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      expiresAt
-    });
+  await db.collection('pairingCodes').doc(code).set({
+    ownerUid: uid,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt: expiresAt
+  });
 
-    // users/{uid} の pairingStatus を「マップごと」更新
-    const userRef = dbx.collection('users').doc(uid);
-    const snap = await userRef.get();
-    const currentPair = snap.exists ? (snap.data().pairingStatus || {}) : {};
+  await db.collection('users').doc(uid).set({
+    pairingStatus: {
+      status: 'waiting',
+      code: code,
+      expiresAt: expiresAt
+    }
+  }, { merge: true });
 
-    await userRef.set(
-      {
-        pairingStatus: {
-          ...currentPair,   // 既存の authProvider / unpairedAt などは維持
-          status: 'waiting',
-          code,
-          expiresAt
-        }
-      },
-      { merge: true }
-    );
-
-    res.json({ code, expiresAt: Math.floor(expiresAtMs / 1000) });
-  } catch (e) {
-    console.error('[pair/create] failed:', e);
-    res.status(500).json({ error: 'Failed to issue a pair code.' });
-  }
+  return { code, expiresAt: Math.floor(expiresAtMs / 1000) };
 });
 
+exports.acceptPairingCode = functions.https.onCall(async (data, context) => {
+  const partnerUid = getUid(context);
+  const code = String(data.code || '').trim();
 
-app.post('/pair/accept', firebaseAuthMiddleware, async (req, res) => {
-  const partnerUid = req.auth.uid; // B
-  const code = String(req.body?.code || '').trim();
-  if (!/^\d{5}$/.test(code)) return res.status(400).json({ message: 'bad code' });
+  if (!/^\d{5}$/.test(code)) throw new functions.https.HttpsError('invalid-argument', 'Bad code');
 
-  const dbx = getDb();
-  const codeRef = dbx.collection('pairingCodes').doc(code);
+  const codeRef = db.collection('pairingCodes').doc(code);
 
   try {
-    await dbx.runTransaction(async (tx) => {
+    await db.runTransaction(async (tx) => {
       const codeSnap = await tx.get(codeRef);
       if (!codeSnap.exists) throw new Error('invalid');
-      const { ownerUid, expiresAt } = codeSnap.data() || {};
+
+      const { ownerUid, expiresAt } = codeSnap.data();
       if (!ownerUid) throw new Error('invalid');
       if (ownerUid === partnerUid) throw new Error('self_pair');
 
-      const expMs = expiresAt?.toMillis?.() ?? 0;
-      if (!expMs || Date.now() > expMs) throw new Error('expired');
+      const expMs = expiresAt?.toMillis() || 0;
+      if (Date.now() > expMs) throw new Error('expired');
 
-      const actorRef = dbx.collection('users').doc(ownerUid);   // A
-      const partnerRef = dbx.collection('users').doc(partnerUid); // B
+      const actorRef = db.collection('users').doc(ownerUid);
+      const partnerRef = db.collection('users').doc(partnerUid);
 
       const [aSnap, pSnap] = await Promise.all([tx.get(actorRef), tx.get(partnerRef)]);
-      const a = aSnap.data()?.pairingStatus || {};
-      const p = pSnap.data()?.pairingStatus || {};
+      const aPair = aSnap.data()?.pairingStatus || {};
+      const pPair = pSnap.data()?.pairingStatus || {};
 
-      if (a.status === 'paired' && a.partnerUid && a.partnerUid !== partnerUid)
-        throw new Error('actor_already_paired');
-      if (p.status === 'paired' && p.partnerUid && p.partnerUid !== ownerUid)
-        throw new Error('partner_already_paired');
+      if (aPair.status === 'paired' && aPair.partnerUid !== partnerUid) throw new Error('actor_already_paired');
+      if (pPair.status === 'paired' && pPair.partnerUid !== ownerUid) throw new Error('partner_already_paired');
 
       const nowTs = admin.firestore.FieldValue.serverTimestamp();
 
-      // ★ A側（actor）の pairingStatus マップを組み立て
-      const newActorPair = {
-        ...a,                     // 既存の authProvider / unpairedAt などを維持
-        status: 'paired',
-        partnerUid,
-        pairedAt: nowTs,
-        code: null,
-        expiresAt: null
-      };
+      tx.set(actorRef, {
+        pairingStatus: {
+          status: 'paired',
+          partnerUid: partnerUid,
+          partnerProvider: 'app',
+          authProvider: 'app',
+          pairedAt: nowTs,
+          code: null,
+          expiresAt: null
+        }
+      }, { merge: true });
 
-      // ★ B側（partner）の pairingStatus マップ
-      const newPartnerPair = {
-        ...p,                     // こちらも既存フィールドを維持
-        status: 'paired',
-        partnerUid: ownerUid,
-        pairedAt: nowTs,
-        code: null,
-        expiresAt: null
-      };
+      tx.set(partnerRef, {
+        pairingStatus: {
+          status: 'paired',
+          partnerUid: ownerUid,
+          partnerProvider: 'app',
+          authProvider: 'app',
+          pairedAt: nowTs,
+          code: null,
+          expiresAt: null
+        }
+      }, { merge: true });
 
-      // ★ マップごと set する（ドット記法は使わない）
-      tx.set(
-        actorRef,
-        { pairingStatus: newActorPair },
-        { merge: true }
-      );
-
-      tx.set(
-        partnerRef,
-        { pairingStatus: newPartnerPair },
-        { merge: true }
-      );
-
-      // ワンタイム消費
       tx.delete(codeRef);
     });
-
-    res.json({ ok: true });
+    return { success: true };
   } catch (e) {
-    console.error('[pair/accept] failed raw error:', e);
-
-    const msg = String(e.message || e);
-    const status =
-      /invalid|bad code|expired|self_pair/i.test(msg)
-        ? 400
-        : /actor_already_paired|partner_already_paired/i.test(msg)
-          ? 409
-          : 500;
-
-    console.error('[pair/accept] failed:', msg);
-    res.status(status).json({ message: msg });
+    console.error('[acceptPairingCode] failed', e);
+    let code = 'internal';
+    let msg = 'Pairing failed';
+    if (e.message === 'invalid') { code = 'not-found'; msg = 'コードが無効です'; }
+    if (e.message === 'expired') { code = 'deadline-exceeded'; msg = '期限切れです'; }
+    if (e.message === 'self_pair') { code = 'invalid-argument'; msg = '自分自身とはペアリング不可'; }
+    if (e.message.includes('already_paired')) { code = 'already-exists'; msg = '既にペアリング済み'; }
+    throw new functions.https.HttpsError(code, msg);
   }
 });
 
-
-
-// ============================================================
-//  LINE でコード入力 → その場で確定（paired、冪等）
-//  partnerLineUserId は使わず、partnerUid に統合して保存
-// ============================================================
-async function finalizePairingByLine(code, partnerUidFromLine) {
-  const dbx = getDb();
-  const codeRef = dbx.collection('pairingCodes').doc(code);
-
-  await dbx.runTransaction(async (tx) => {
-    const codeSnap = await tx.get(codeRef);
-    if (!codeSnap.exists) throw new Error('invalid');
-    const { ownerUid, expiresAt } = codeSnap.data() || {};
-    if (!ownerUid) throw new Error('invalid');
-
-    const expMs = expiresAt?.toMillis?.() ?? 0;
-    if (!expMs || Date.now() > expMs) throw new Error('expired');
-
-    const actorRef = dbx.collection('users').doc(ownerUid);
-    const nowTs = admin.firestore.FieldValue.serverTimestamp();
-
-    // 既存 pairingStatus を取り込む
-    const actorSnap = await tx.get(actorRef);
-    const currentPair = actorSnap.exists ? (actorSnap.data().pairingStatus || {}) : {};
-
-    const newPair = {
-      ...currentPair,
-      status: 'paired',
-      partnerUid: partnerUidFromLine,
-      pairedAt: nowTs,
-      code: null,
-      expiresAt: null
-    };
-
-    tx.set(
-      actorRef,
-      { pairingStatus: newPair },
-      { merge: true }
-    );
-
-    tx.delete(codeRef);
-  });
-
-  return { ok: true };
-}
-
-
-// ===== LINE webhook =====
-app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
-  res.sendStatus(200);
+exports.unpair = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
   try {
-    const events = req.body?.events || [];
-    await Promise.all(events.map(handleEvent));
-  } catch (e) {
-    console.error('[webhook] error', e);
-  }
-});
-
-async function handleEvent(event) {
-  try {
-    // 1) 5桁コード or "pair XXXXX"
-    if (event.type === 'message' && event.message?.type === 'text' && event.source?.userId) {
-      const text = (event.message.text || '').trim();
-      const partnerLineUserId = event.source.userId; // ここは LINE userId
-      let pairingCode = null;
-
-      if (/^\d{5}$/.test(text)) pairingCode = text;
-      else {
-        const m = /^pair\s+([A-Z0-9]{5,10})$/i.exec(text);
-        if (m) pairingCode = m[1].toUpperCase();
-      }
-
-      if (pairingCode) {
-        try {
-          await finalizePairingByLine(pairingCode, partnerLineUserId);
-          return reply(event.replyToken, 'ペアリングが完了しました。アプリ側に反映されます。');
-        } catch (error) {
-          const msg = String(error.message || error);
-          console.error('[webhook/pair-finalize] error', msg);
-          if (/invalid/.test(msg)) return reply(event.replyToken, `コード ${pairingCode} は無効です。`);
-          if (/expired/.test(msg)) return reply(event.replyToken, `コード ${pairingCode} は有効期限切れです。`);
-          return reply(event.replyToken, 'エラーが発生しました。');
-        }
-      }
-    }
-
-    // 2) 解除ポストバック
-    if (event.type === 'postback') {
-      const data = event.postback?.data || '';
-      const ap = /^approve:(.+)$/i.exec(data);
-      const rj = /^reject:(.+)$/i.exec(data);
-      if (ap) {
-        const appUserUid = ap[1];
-        try {
-          const userRef = getDb().collection('users').doc(appUserUid);
-          await userRef.update({
-            'blockStatus.isActive': false,
-            'blockStatus.activatedAt': null
-          });
-          if (event.source?.userId) {
-            await client.pushMessage(event.source.userId, {
-              type: 'text',
-              text: '承認しました。'
-            });
-          }
-        } catch (err) {
-          console.error('[webhook/approve] failed:', err);
-        }
-        return;
-      }
-      if (rj) {
-        if (event.source?.userId) {
-          await client.pushMessage(event.source.userId, {
-            type: 'text',
-            text: '解除申請を拒否しました。'
-          });
-        }
-        return;
-      }
-    }
-  } catch (err) {
-    console.error('[handleEvent] failed', err);
-  }
-}
-
-// ===== その他API =====
-
-// 強制解除リクエスト（テストユーザの即時処理含む）
-app.post('/request-partner-unlock', firebaseAuthMiddleware, async (req, res) => {
-  const uid = req.auth.uid;
-  const email = req.auth.email;
-  const dbx = getDb();
-  try {
-    // テストユーザは即解除
-    if (email === 'nomorebettest@gmail.com') {
-      const userRef = dbx.collection('users').doc(uid);
-      await userRef.update({
-        'blockStatus.isActive': false,
-        'blockStatus.activatedAt': null
-      });
-      console.log(`[test-unlock] Auto-unlocked: user=${uid}`);
-      return res.json({ ok: true, message: 'Auto-unlocked for test user.' });
-    }
-
-    const userRef = dbx.collection('users').doc(uid);
-    const userSnap = await userRef.get();
-    if (!userSnap.exists) return res.status(404).json({ error: 'User not found' });
-
-    const pairingStatus = userSnap.data().pairingStatus || {};
-    const partnerUid = pairingStatus.partnerUid; // ★ ここを統一
-    if (!partnerUid || pairingStatus.status !== 'paired') {
-      return res.status(400).json({ error: 'Partner is not configured.' });
-    }
-
-    await client.pushMessage(partnerUid, {
-      type: 'template',
-      altText: '解除申請が届きました',
-      template: {
-        type: 'confirm',
-        text: 'パートナーからブロック解除の申請が届きました。承認しますか？',
-        actions: [
-          { type: 'postback', label: '承認する', data: `approve:${uid}` },
-          { type: 'postback', label: '拒否する', data: `reject:${uid}` }
-        ]
-      }
-    });
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[request-partner-unlock] failed:', e);
-    res.status(500).json({ error: 'Failed to process unlock request.' });
-  }
-});
-
-// ============================================================
-//  ペアリング解除（当事者側から）
-//  - 当事者(uid)の pairingStatus / blockStatus をリセット
-//  - partnerUid がアプリユーザなら、そのユーザの pairingStatus もリセット
-// ============================================================
-// ─────────────────────────────
-// ペアリング解除API（当事者 or パートナーどちらからでもOK）
-// ─────────────────────────────
-app.post('/pair/unpair', firebaseAuthMiddleware, async (req, res) => {
-  try {
-    const uid = req.auth.uid;           // 呼び出した側（当事者 or パートナー）
-    const dbx = getDb();
-
-    await dbx.runTransaction(async (tx) => {
-      const selfRef = dbx.collection('users').doc(uid);
+    await db.runTransaction(async (tx) => {
+      const selfRef = db.collection('users').doc(uid);
       const selfSnap = await tx.get(selfRef);
-      if (!selfSnap.exists) {
-        throw new Error('self_not_found');
-      }
+      if (!selfSnap.exists) throw new functions.https.HttpsError('not-found', 'User not found');
 
       const selfData = selfSnap.data() || {};
       const selfPair = selfData.pairingStatus || {};
-      if (selfPair.status !== 'paired') {
-        throw new Error('not_paired');
-      }
-
-      const partnerUid = selfPair.partnerUid || null;
-
-      // 解除時刻（両者共通でOK）
+      const partnerUid = selfPair.partnerUid;
       const nowTs = admin.firestore.FieldValue.serverTimestamp();
 
-      // まず全て read
-      let partnerRef = null;
-      let partnerSnap = null;
-      let partnerPair = null;
+      tx.set(selfRef, {
+        pairingStatus: {
+          status: 'unpaired',
+          partnerUid: null,
+          partnerId: null,
+          authProvider: null,
+          code: null,
+          expiresAt: null,
+          unpairedAt: nowTs
+        },
+        blockStatus: {
+          unlockMethod: null,
+          unlockDays: null,
+          expiresAt: null
+        }
+      }, { merge: true });
 
       if (partnerUid) {
-        partnerRef = dbx.collection('users').doc(partnerUid);
-        partnerSnap = await tx.get(partnerRef);
+        const partnerRef = db.collection('users').doc(partnerUid);
+        const partnerSnap = await tx.get(partnerRef);
         if (partnerSnap.exists) {
-          partnerPair = (partnerSnap.data() || {}).pairingStatus || {};
-        }
-      }
-
-      // --- ここから write ---
-
-      // --- ここから write ---
-
-      // 既存の blockStatus も読み出しておく
-      const selfBlock = selfData.blockStatus || {};
-
-      // 自分側: pairingStatus / blockStatus をマップごと更新
-      const newSelfPair = {
-        ...selfPair,
-        status: 'unpaired',
-        partnerUid: null,
-        authProvider: null,
-        code: null,
-        expiresAt: null,
-        unpairedAt: nowTs
-      };
-
-      const newSelfBlock = {
-        ...selfBlock,
-        unlockMethod: null,
-        unlockDays: null,
-        expiresAt: null
-      };
-
-      tx.set(
-        selfRef,
-        {
-          pairingStatus: newSelfPair,
-          blockStatus: newSelfBlock
-        },
-        { merge: true }
-      );
-
-      // 相手側が相互ペアなら同様に解除
-      if (partnerRef && partnerSnap && partnerSnap.exists) {
-        if (partnerPair && partnerPair.status === 'paired' && partnerPair.partnerUid === uid) {
-          const newPartnerPair = {
-            ...partnerPair,
-            status: 'unpaired',
-            partnerUid: null,
-            authProvider: null,
-            code: null,
-            expiresAt: null,
-            unpairedAt: nowTs
-          };
-
-          tx.set(
-            partnerRef,
-            { pairingStatus: newPartnerPair },
-            { merge: true }
-          );
-        }
-      }
-
-
-
-    });
-
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error('[pair/unpair] failed', e);
-    const msg = String(e.message || e);
-    const status =
-      /not_paired|self_not_found/.test(msg) ? 400 : 500;
-    return res.status(status).json({ ok: false, error: msg });
-  }
-});
-
-
-
-// 強制解除の通知API
-app.post('/force-unlock-notify', firebaseAuthMiddleware, async (req, res) => {
-  const uid = req.auth.uid;
-  try {
-    const dbx = getDb();
-    const userSnap = await dbx.collection('users').doc(uid).get();
-    if (!userSnap.exists) return res.status(404).json({ error: 'User not found' });
-
-    const pairingStatus = userSnap.data().pairingStatus || {};
-    const partnerUid = pairingStatus.partnerUid; // ★ 統一
-    if (partnerUid && pairingStatus.status === 'paired') {
-      await client.pushMessage(partnerUid, {
-        type: 'text',
-        text: '【nomoreBET お知らせ】\nパートナーが強制解除機能を使用しました。'
-      });
-      console.log(`[force-unlock] 通知送信: user=${uid}, partner=${partnerUid}`);
-    }
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[force-unlock-notify] failed', e);
-    res.status(500).json({ error: 'Failed to send notification.' });
-  }
-});
-
-// Heartbeat（※ 修正版：ログ記録とブロック状態の更新を行う）
-app.post('/heartbeat', firebaseAuthMiddleware, async (req, res) => {
-  const uid = req.auth.uid;
-  
-  // ★追加: アプリから送られてきたデータを受け取る
-  // Android側で送っているキー名 (isBlockActive, timingType) と合わせます
-  const { isBlockActive, timingType } = req.body || {};
-
-  try {
-    const dbx = getDb();
-    const userRef = dbx.collection('users').doc(uid);
-    const nowTs = admin.firestore.FieldValue.serverTimestamp();
-
-    // 1. ユーザー情報の更新 (最新状態)
-    // lastHeartbeat の更新に加え、ブロック状態(reportedBlockStatus)も更新します
-    await userRef.set({
-      heartbeat: {
-        lastHeartbeat: nowTs,
-        // アプリから送られてきたブロック状態を記録
-        reportedBlockStatus: isBlockActive === true 
-      }
-    }, { merge: true });
-
-    // 2. ★追加: ログの記録 (Android側で削除した処理をここで代行)
-    // サーバーの正確な時間で記録します
-    const logData = {
-      timestamp: nowTs,          // サーバー時間 (Firestore Timestamp)
-      executedAt: Date.now(),    // 数値のミリ秒 (表示順序用)
-      timingType: timingType || 'unknown',
-      
-      // ブロック状態を boolean で記録
-      blockStatus: isBlockActive === true
-    };
-
-    // ドキュメントID生成 (Androidの "yyyy-MM-dd-HH-mm" 形式に合わせる)
-    // サーバーのロケールに関わらず日本時間でフォーマットします
-    const d = new Date();
-    const docId = d.toLocaleString('ja-JP', { 
-      timeZone: 'Asia/Tokyo',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit'
-    })
-    .replace(/\//g, '-')   // スラッシュをハイフンに
-    .replace(/ /g, '-')    // スペースをハイフンに
-    .replace(/:/g, '-');   // コロンがあればハイフンに
-
-    // heartbeat_logs コレクションに書き込み
-    await userRef.collection('heartbeat_logs').doc(docId).set(logData);
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error(`[heartbeat] failed for user ${uid}`, e);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// ACK: waiting→replied
-app.post('/ack-ping', async (req, res) => {
-  const uid = req.body?.uid;
-  const fcmTokenFromApp = req.body?.fcmToken;
-  const pingId = req.body?.pingId;
-  if (!pingId || !uid || !fcmTokenFromApp) {
-    console.warn('[ack-ping] 400 Bad Request', req.body);
-    return res.status(400).json({ error: 'pingId, uid, and fcmToken are required' });
-  }
-  try {
-    const dbx = getDb();
-    const userRef = dbx.collection('users').doc(uid);
-    const userSnap = await userRef.get();
-    if (!userSnap.exists) return res.status(404).json({ error: 'User not found' });
-
-    const storedFcmToken = userSnap.data()?.deviceStatus?.fcmToken;
-    if (storedFcmToken !== fcmTokenFromApp) {
-      console.warn('[ack-ping] FCM token mismatch', { uid });
-      return res.status(403).json({ error: 'Unauthorized: Invalid device token' });
-    }
-
-    const q = await userRef
-      .collection('pendingPings')
-      .where('id', '==', pingId)
-      .limit(1)
-      .get();
-    if (q.empty) return res.json({ ok: true, message: 'not found' });
-    const snap = q.docs[0];
-    const data = snap.data();
-    if (data.status !== 'waiting') return res.json({ ok: true, message: `ignored (${data.status})` });
-
-    const deadlineMs =
-      data.expiresAt?.toMillis?.() ?? data.sentAt?.toMillis?.() + PING_ACK_WINDOW_MS;
-    const newStatus = Date.now() <= deadlineMs ? 'replied' : 'replied_late';
-    await snap.ref.set(
-      {
-        status: newStatus,
-        repliedAt: admin.firestore.FieldValue.serverTimestamp()
-      },
-      { merge: true }
-    );
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[ack-ping] failed', e);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// ===== Cron =====
-app.get('/cron/check-heartbeats', async (req, res) => {
-  if (!CRON_SECRET || req.query.secret !== CRON_SECRET) {
-    console.warn('[cron] 403 secret mismatch');
-    return res.status(403).json({ error: 'Forbidden' });
-  }
-
-  const dbx = getDb();
-  const nowTs = admin.firestore.Timestamp.now();
-  const staleCutoff = admin.firestore.Timestamp.fromMillis(
-    nowTs.toMillis() - minutes(STALE_MINUTES)
-  );
-  const longOfflineCutoff = admin.firestore.Timestamp.fromMillis(
-    nowTs.toMillis() - minutes(LONG_OFFLINE_MIN)
-  );
-
-  try {
-    // 1) waiting期限切れ
-    const allUsers = await dbx.collection('users').get();
-    for (const userDoc of allUsers.docs) {
-      const userRef = userDoc.ref;
-      const pairingStatus = userDoc.data()?.pairingStatus || {};
-      const partnerUid = pairingStatus.partnerUid; // ★ 統一
-
-      const overdue = await userRef
-        .collection('pendingPings')
-        .where('status', '==', 'waiting')
-        .where('expiresAt', '<', nowTs)
-        .get();
-
-      if (!overdue.empty) {
-        const batch = dbx.batch();
-        for (const ping of overdue.docs) {
-          batch.set(
-            ping.ref,
-            { status: 'expired', expiredAt: nowTs },
-            { merge: true }
-          );
-
-          if (partnerUid) {
-            const sentAt = ping.data().sentAt;
-            let timeString = '一定時間';
-            if (sentAt) {
-              const date = sentAt.toDate();
-              timeString = new Intl.DateTimeFormat('ja-JP', {
-                month: 'numeric',
-                day: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit',
-                timeZone: 'Asia/Tokyo'
-              }).format(date);
-            }
-            try {
-              await client.pushMessage(partnerUid, {
-                type: 'text',
-                text:
-                  `【nomoreBET お知らせ】\n` +
-                  `パートナーの端末から、ブロック機能が有効であることを示す定期的な信号が途絶えています。\n\n` +
-                  `${timeString}ごろ、ブロック機能が一時的に無効になっていた可能性があります。パートナーの方にご確認ください。\n\n` +
-                  `※端末の電源OFF、圏外、設定変更などが原因の場合もあります。`
-              });
-            } catch (e) {
-              console.error('[cron] LINE push error:', e);
-            }
+          const pPair = partnerSnap.data()?.pairingStatus || {};
+          if (pPair.status === 'paired' && pPair.partnerUid === uid) {
+            tx.set(partnerRef, {
+              pairingStatus: {
+                status: 'unpaired',
+                partnerUid: null,
+                partnerId: null,
+                authProvider: null,
+                code: null,
+                expiresAt: null,
+                unpairedAt: nowTs
+              }
+            }, { merge: true });
           }
         }
-        await batch.commit();
-        console.log(`[cron] expired marked: user=${userDoc.id}, count=${overdue.size}`);
       }
+    });
+    return { success: true };
+  } catch (e) {
+    console.error('[unpair] failed', e);
+    throw new functions.https.HttpsError('internal', 'Unpair failed');
+  }
+});
+
+exports.approveUnlockApp = functions.https.onCall(async (data, context) => {
+  const partnerUid = getUid(context);
+  const partnerSnap = await db.collection('users').doc(partnerUid).get();
+  const pPair = partnerSnap.data()?.pairingStatus || {};
+
+  if (pPair.status !== 'paired' || !pPair.partnerUid) {
+    throw new functions.https.HttpsError('failed-precondition', 'Not paired');
+  }
+
+  const individualUid = pPair.partnerUid;
+  const indRef = db.collection('users').doc(individualUid);
+  const indSnap = await indRef.get();
+  const indPair = indSnap.data()?.pairingStatus || {};
+
+  if (indPair.status !== 'paired' || indPair.partnerUid !== partnerUid) {
+    throw new functions.https.HttpsError('permission-denied', 'Pairing mismatch');
+  }
+
+  await indRef.set({
+    blockStatus: {
+      isActive: false,
+      activatedAt: null,
+      deactivatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      deactivatedReason: 'partner_approved'
+    },
+    heartbeat: {
+      lastHeartbeat: admin.firestore.FieldValue.serverTimestamp()
     }
+  }, { merge: true });
 
-    // 2) stale への ping（heartbeat.lastHeartbeat を参照）
-    const q = await dbx
-  .collection('users')
-  // ★ ブロックON条件は外す（ブロックOFFでも候補にする）
-  .where('heartbeat.lastHeartbeat', '<', staleCutoff)
-  .where('heartbeat.lastHeartbeat', '>', longOfflineCutoff)
-  .get();
+  return { success: true, individualUid };
+});
 
-
-    console.log('[cron] run', { at: new Date().toISOString(), staleCandidates: q.size });
-
-for (const userDoc of q.docs) {
-  const uid = userDoc.id;
-  const userRef = userDoc.ref;
-  const data = userDoc.data() || {};
-
-  const fcmToken = data.deviceStatus?.fcmToken;
-  if (!fcmToken) {
-    console.warn('[cron] skip (no fcmToken)', uid);
-    continue;
-  }
-
-  // ★ 追加：Firestore に保存されている blockStatus をそのまま使う
-  const currentBlockStatus = !!(data.blockStatus && data.blockStatus.isActive);
-
-  // 既存の waiting チェックなどはそのまま
-  const waitingExists = await userRef
-    .collection('pendingPings')
-    .where('status', '==', 'waiting')
-    .limit(1)
-    .get();
-  if (!waitingExists.empty) {
-    console.log('[cron] skip (waiting exists)', uid);
-    continue;
-  }
-
-  const pingUuid = crypto.randomUUID();
-  const japanFormattedNow = formatTs(nowTs);
-  const docId = makeDocId(japanFormattedNow, pingUuid);
-  const expiresAt = admin.firestore.Timestamp.fromMillis(
-    nowTs.toMillis() + PING_ACK_WINDOW_MS
+exports.updatePairingSettings = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  await db.collection('users').doc(uid).set(
+    { pairingStatus: data },
+    { merge: true }
   );
+  return { success: true };
+});
 
-  await userRef.collection('pendingPings').doc(docId).set({
-    id: pingUuid,
-    readableId: docId,
-    status: 'waiting',
-    sentAt: nowTs,
-    expiresAt,
-    by: 'cron',
+// ============================================================
+//  4. セキュリティ・不正検知
+// ============================================================
+async function updateRevokedConsents(userRef, isAdminActive, isA11yActive) {
+  const snap = await userRef.get();
+  const consents = snap.data()?.consents || {};
+  const updates = {};
 
-    // ★ ここを追加：この ping を発行した時点の Firestore 上のブロック状態
-    blockStatus: currentBlockStatus   // true = 有効, false = 無効 or 未設定
+  if (consents.deviceAdminAgreedAt && isAdminActive === false) {
+    updates['consents.deviceAdminRevokedAt'] = admin.firestore.FieldValue.serverTimestamp();
+  }
+  if (consents.accessibilityAgreedAt && isA11yActive === false) {
+    updates['consents.accessibilityRevokedAt'] = admin.firestore.FieldValue.serverTimestamp();
+  }
+  if (Object.keys(updates).length > 0) {
+    await userRef.update(updates);
+  }
+}
+
+exports.reportFraud = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const { isDeviceAdminActive, isAccessibilityEnabled } = data;
+  const userRef = db.collection('users').doc(uid);
+  
+  await updateRevokedConsents(userRef, isDeviceAdminActive, isAccessibilityEnabled);
+
+  await userRef.set({
+    blockStatus: {
+      isActive: false,
+      deactivatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      deactivatedReason: 'fraud'
+    }
+  }, { merge: true });
+  return { success: true };
+});
+
+exports.reportRevokedConsents = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const { isDeviceAdminActive, isAccessibilityEnabled } = data;
+  const userRef = db.collection('users').doc(uid);
+  await updateRevokedConsents(userRef, isDeviceAdminActive, isAccessibilityEnabled);
+  return { success: true };
+});
+
+exports.saveConsent = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const { type } = data; 
+  const updates = {};
+  if (type === 'accessibility') updates['consents.accessibilityAgreedAt'] = admin.firestore.FieldValue.serverTimestamp();
+  else if (type === 'deviceAdmin') updates['consents.deviceAdminAgreedAt'] = admin.firestore.FieldValue.serverTimestamp();
+
+  if (Object.keys(updates).length > 0) {
+    await db.collection('users').doc(uid).update(updates);
+  }
+  return { success: true };
+});
+
+// ============================================================
+//  5. ハートビート & Ping
+// ============================================================
+exports.heartbeat = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const { isBlockActive, timingType } = data;
+  const nowTs = admin.firestore.FieldValue.serverTimestamp();
+  const userRef = db.collection('users').doc(uid);
+
+  await userRef.set({
+    heartbeat: {
+      lastHeartbeat: nowTs,
+      reportedBlockStatus: isBlockActive === true
+    }
+  }, { merge: true });
+
+  const d = new Date();
+  const docId = d.toLocaleString('ja-JP', { 
+    timeZone: 'Asia/Tokyo',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit'
+  }).replace(/[\/\s:]/g, '-');
+
+  await userRef.collection('heartbeat_logs').doc(docId).set({
+    timestamp: nowTs,
+    executedAt: Date.now(),
+    timingType: timingType || 'unknown',
+    blockStatus: isBlockActive === true
   });
+  return { success: true };
+});
+
+exports.ackPing = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const { pingId, fcmToken } = data;
+  if (!pingId) throw new functions.https.HttpsError('invalid-argument', 'pingId required');
+
+  const userRef = db.collection('users').doc(uid);
+  const userSnap = await userRef.get();
+  const storedToken = userSnap.data()?.deviceStatus?.fcmToken;
+  
+  if (fcmToken && storedToken !== fcmToken) {
+    console.warn(`[ackPing] Token mismatch for user ${uid}`);
+  }
+
+  const q = await userRef.collection('pendingPings').where('id', '==', pingId).limit(1).get();
+  if (q.empty) return { success: true, message: 'not found' };
+
+  const doc = q.docs[0];
+  const pingData = doc.data();
+  if (pingData.status !== 'waiting') return { success: true, message: 'already processed' };
+
+  const sentMs = pingData.sentAt?.toMillis() || 0;
+  const deadlineMs = pingData.expiresAt?.toMillis() || (sentMs + PING_ACK_WINDOW_MS);
+  const isLate = Date.now() > deadlineMs;
+  const newStatus = isLate ? 'replied_late' : 'replied';
+
+  await doc.ref.update({
+    status: newStatus,
+    repliedAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+  return { success: true, status: newStatus };
+});
+
+// ============================================================
+//  ★追加: ブロックリスト操作 (BlockedItemsRepository対応)
+// ============================================================
+exports.addBlockedItem = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const { name, url, appPackageName } = data;
+
+  const newItem = {
+    name: name,
+    url: url || null,
+    appPackageName: appPackageName || null,
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  };
+
+  const ref = await db.collection('users').doc(uid).collection('blocked_items').add(newItem);
+  await ref.update({ id: ref.id });
+  return { success: true, id: ref.id };
+});
+
+exports.updateBlockedItem = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const { itemId, name, url, appPackageName } = data;
+  if (!itemId) throw new functions.https.HttpsError('invalid-argument', 'itemId required');
+
+  const updates = {};
+  if (name !== undefined) updates.name = name;
+  if (url === null) updates.url = admin.firestore.FieldValue.delete();
+  else if (url !== undefined) updates.url = url;
+  if (appPackageName === null) updates.appPackageName = admin.firestore.FieldValue.delete();
+  else if (appPackageName !== undefined) updates.appPackageName = appPackageName;
+
+  await db.collection('users').doc(uid).collection('blocked_items').doc(itemId).update(updates);
+  return { success: true };
+});
+
+exports.deleteBlockedItem = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const { itemId } = data;
+  if (!itemId) throw new functions.https.HttpsError('invalid-argument', 'itemId required');
+
+  await db.collection('users').doc(uid).collection('blocked_items').doc(itemId).delete();
+  return { success: true };
+});
+
+// ============================================================
+//  6. LINE Bot & Cron (HTTP Trigger)
+// ============================================================
+exports.lineWebhook = functions.https.onRequest(async (req, res) => {
+  if (req.method !== 'POST') { res.status(405).send('Method Not Allowed'); return; }
+  const events = req.body.events || [];
+  try {
+    await Promise.all(events.map(handleLineEvent));
+    res.status(200).send('OK');
+  } catch (e) {
+    console.error('[lineWebhook] error', e);
+    res.status(500).send('Error');
+  }
+});
+
+async function handleLineEvent(event) {
+  if (event.type === 'message' && event.message.type === 'text') {
+    const text = event.message.text.trim();
+    let pairingCode = null;
+    if (/^\d{5}$/.test(text)) pairingCode = text;
+    else {
+      const m = /^pair\s+([A-Z0-9]{5,10})$/i.exec(text);
+      if (m) pairingCode = m[1].toUpperCase();
+    }
+    if (pairingCode) {
+      await finalizePairingByLine(pairingCode, event.source.userId, event.replyToken);
+    }
+  }
+  if (event.type === 'postback') {
+    const data = event.postback.data;
+    const ap = /^approve:(.+)$/i.exec(data);
+    const rj = /^reject:(.+)$/i.exec(data);
+    if (ap) {
+      const uid = ap[1];
+      await db.collection('users').doc(uid).update({
+        'blockStatus.isActive': false,
+        'blockStatus.activatedAt': null
+      });
+      if (event.source.userId) {
+        await client.pushMessage(event.source.userId, { type: 'text', text: '承認しました。' });
+      }
+    } else if (rj && event.source.userId) {
+      await client.pushMessage(event.source.userId, { type: 'text', text: '拒否しました。' });
+    }
+  }
+}
+
+async function finalizePairingByLine(code, lineUserId, replyToken) {
+  const codeRef = db.collection('pairingCodes').doc(code);
+  try {
+    await db.runTransaction(async (tx) => {
+      const codeSnap = await tx.get(codeRef);
+      if (!codeSnap.exists) throw new Error('invalid');
+      const { ownerUid, expiresAt } = codeSnap.data();
+      if (!ownerUid) throw new Error('invalid');
+      if (Date.now() > (expiresAt?.toMillis() || 0)) throw new Error('expired');
+
+      const userRef = db.collection('users').doc(ownerUid);
+      const nowTs = admin.firestore.FieldValue.serverTimestamp();
+
+      tx.set(userRef, {
+        pairingStatus: {
+          status: 'paired',
+          partnerUid: lineUserId,
+          authProvider: 'line',
+          pairedAt: nowTs,
+          code: null,
+          expiresAt: null
+        }
+      }, { merge: true });
+      tx.delete(codeRef);
+    });
+    await client.replyMessage(replyToken, { type: 'text', text: 'ペアリングが完了しました。' });
+  } catch (e) {
+    const msg = e.message === 'expired' ? 'コード期限切れです' : 'コードが無効です';
+    await client.replyMessage(replyToken, { type: 'text', text: msg });
+  }
+}
+
+exports.cronCheckHeartbeats = functions.https.onRequest(async (req, res) => {
+  if (req.query.secret !== CRON_SECRET) { res.status(403).send('Forbidden'); return; }
+  const nowTs = admin.firestore.Timestamp.now();
+  const staleCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - minutes(STALE_MINUTES));
+  const longOfflineCutoff = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() - minutes(LONG_OFFLINE_MIN));
+
+  try {
+    const q = await db.collection('users')
+      .where('heartbeat.lastHeartbeat', '<', staleCutoff)
+      .where('heartbeat.lastHeartbeat', '>', longOfflineCutoff)
+      .get();
+
+    for (const doc of q.docs) {
+      const uid = doc.id;
+      const data = doc.data();
+      const fcmToken = data.deviceStatus?.fcmToken;
+      if (!fcmToken) continue;
+
+      const waiting = await doc.ref.collection('pendingPings').where('status', '==', 'waiting').limit(1).get();
+      if (!waiting.empty) continue;
+
+      const pingId = crypto.randomUUID();
+      const expiresAt = admin.firestore.Timestamp.fromMillis(nowTs.toMillis() + PING_ACK_WINDOW_MS);
+      const docId = makeDocId(formatTs(nowTs), pingId);
+
+      await doc.ref.collection('pendingPings').doc(docId).set({
+        id: pingId,
+        readableId: docId,
+        status: 'waiting',
+        sentAt: nowTs,
+        expiresAt: expiresAt,
+        by: 'cron',
+        blockStatus: !!(data.blockStatus?.isActive)
+      });
 
       try {
         await admin.messaging().send({
           token: fcmToken,
-          data: { action: 'ping_challenge', pingId: pingUuid, uid },
+          data: { action: 'ping_challenge', pingId: pingId, uid: uid },
           android: { priority: 'high', ttl: PING_TTL_MS }
         });
-
-        await userRef.set(
-          {
-            deviceStatus: {
-              lastFcmOkAt: admin.firestore.FieldValue.serverTimestamp(),
-              fcmConsecutiveFails: 0,
-              gmsIssueSuspected: false
-            }
-          },
-          { merge: true }
-        );
-
-        console.log('[cron] ping queued', { uid, pingUuid, docId });
-      } catch (sendErr) {
-        const code = sendErr?.errorInfo?.code || sendErr?.code || 'unknown';
-        console.error('[cron] FCM send error', uid, code, sendErr?.message);
-
-        try {
-          await userRef.collection('fcmSendLogs').add({
-            token: fcmToken,
-            code,
-            message: sendErr?.message || '',
-            at: admin.firestore.FieldValue.serverTimestamp()
-          });
-        } catch (logErr) {
-          console.error('[cron] fcmSendLogs add error:', logErr);
-        }
-
-        if (code === 'messaging/registration-token-not-registered') {
-          await userRef.set(
-            {
-              deviceStatus: {
-                fcmToken: admin.firestore.FieldValue.delete(),
-                fcmConsecutiveFails: admin.firestore.FieldValue.increment(1),
-                gmsIssueSuspected: false
-              }
-            },
-            { merge: true }
-          );
-        } else {
-          await userRef.set(
-            {
-              deviceStatus: {
-                fcmConsecutiveFails: admin.firestore.FieldValue.increment(1)
-              }
-            },
-            { merge: true }
-          );
-        }
-
-        try {
-          const fresh = await userRef.get();
-          const dev = fresh.data()?.deviceStatus || {};
-          if ((dev.fcmConsecutiveFails || 0) >= FCM_FAIL_THRESHOLD) {
-            await userRef.set(
-              { deviceStatus: { gmsIssueSuspected: true } },
-              { merge: true }
-            );
-          }
-        } catch (readErr) {
-          console.error('[cron] read-after-fail error:', readErr);
-        }
+      } catch (err) {
+        console.error(`FCM failed for ${uid}:`, err);
       }
     }
-
-    // 3) 古い ping の掃除（48h）
-    try {
-      const cleanupCutoff = admin.firestore.Timestamp.fromMillis(
-        nowTs.toMillis() - hours(48)
-      );
-      const allUsers2 = await dbx.collection('users').get();
-      for (const userDoc of allUsers2.docs) {
-        const old = await userDoc.ref
-          .collection('pendingPings')
-          .where('sentAt', '<', cleanupCutoff)
-          .get();
-        if (!old.empty) {
-          const batch = dbx.batch();
-          old.docs.forEach((doc) => batch.delete(doc.ref));
-          await batch.commit();
-          console.log(
-            `[cron-cleanup] cleaned old pings: user=${userDoc.id}, count=${old.size}`
-          );
-        }
-      }
-    } catch (e) {
-      console.error('[cron-cleanup] failed', e);
-    }
-
-    // 4) 古い heartbeat_logs の掃除（2日＝48h）
-    try {
-      const hbCutoffTs = admin.firestore.Timestamp.fromMillis(
-        nowTs.toMillis() - hours(48)
-      );
-      const hbCutoffMs = hbCutoffTs.toMillis();
-
-      const allUsersForHB = await dbx.collection('users').get();
-      const writer = admin.firestore().bulkWriter();
-
-      for (const userDoc of allUsersForHB.docs) {
-        const userRef = userDoc.ref;
-        const hbCol = userRef.collection('heartbeat_logs');
-
-        // case A: timestamp(Timestamp型) を基準に削除
-        const oldByTimestamp = await hbCol.where('timestamp', '<', hbCutoffTs).get();
-        for (const d of oldByTimestamp.docs) writer.delete(d.ref);
-
-        // case B: executedAt(Number ms) を基準に削除
-        const oldByExecutedAt = await hbCol
-          .where('executedAt', '<', hbCutoffMs)
-          .get();
-        for (const d of oldByExecutedAt.docs) writer.delete(d.ref);
-      }
-
-      await writer.close();
-      console.log(
-        '[cron-cleanup] cleaned old heartbeat_logs up to',
-        hbCutoffTs.toDate().toISOString()
-      );
-    } catch (e) {
-      console.error('[cron-cleanup-heartbeats] failed', e);
-    }
-
-    return res.json({ ok: true, staleChecked: q.size });
+    res.json({ ok: true, checked: q.size });
   } catch (e) {
-    console.error('[cron] failed', e);
-    return res.status(500).json({ error: 'Internal error' });
+    console.error('cron error', e);
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ===== Probe =====
-app.get('/probe/check', (req, res) => {
-  if (!PROBE_SECRET) return res.status(500).json({ error: 'PROBE_SECRET not set' });
-  const nonce = String(req.query.nonce || '');
-  if (!/^[A-Za-z0-9._~\-]{8,128}$/.test(nonce))
-    return res.status(400).json({ error: 'bad nonce' });
-  const sig = crypto.createHmac('sha256', PROBE_SECRET).update(nonce, 'utf8').digest('base64');
-  res.set('Cache-Control', 'no-store');
-  res.json({ alg: 'HS256', sig });
+// 追加 (addPromise)
+exports.addPromise = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const { text } = data;
+
+  if (!text) throw new functions.https.HttpsError('invalid-argument', 'Text required');
+
+  const nowTs = admin.firestore.FieldValue.serverTimestamp();
+  
+  await db.collection('users').doc(uid).collection('promises').add({
+    text: text,
+    createdAt: nowTs,
+    updatedAt: nowTs,
+    createdBy: 'individual',
+    status: 'active'
+  });
+
+  return { success: true };
 });
 
-// 承認（アプリ認証パートナー向け）：自分(=partnerUid)とペアの当事者を特定して解除
-app.post('/partner/approve-unlock-app', firebaseAuthMiddleware, async (req, res) => {
-  try {
-    const partnerUid = req.auth.uid;
-    const dbx = getDb();
+// 更新 (updatePromise)
+exports.updatePromise = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const { promiseId, text } = data;
 
-    const partnerSnap = await dbx.collection('users').doc(partnerUid).get();
-    if (!partnerSnap.exists) return res.status(404).json({ error: 'partner not found' });
-    const p = partnerSnap.data()?.pairingStatus || {};
-    if (p.status !== 'paired') return res.status(400).json({ error: 'not paired' });
+  if (!promiseId || !text) throw new functions.https.HttpsError('invalid-argument', 'Invalid arguments');
 
-    const q = await dbx
-      .collection('users')
-      .where('pairingStatus.partnerUid', '==', partnerUid)
-      .limit(1)
-      .get();
-    if (q.empty) return res.status(404).json({ error: 'individual not found' });
+  await db.collection('users').doc(uid).collection('promises').doc(promiseId).update({
+    text: text,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+  });
 
-    const individualRef = q.docs[0].ref;
-    const individualUid = individualRef.id;
-
-    const indSnap = await individualRef.get();
-    const ind = indSnap.data()?.pairingStatus || {};
-    if (ind.status !== 'paired' || ind.partnerUid !== partnerUid) {
-      return res.status(403).json({ error: 'pairing mismatch' });
-    }
-
-    await individualRef.set(
-      {
-        blockStatus: {
-          isActive: false,
-          activatedAt: null
-        },
-        heartbeat: {
-          lastHeartbeat: admin.firestore.FieldValue.serverTimestamp()
-        }
-      },
-      { merge: true }
-    );
-
-    return res.json({ ok: true, individualUid });
-  } catch (e) {
-    console.error('[approve-unlock-app] failed', e);
-    return res.status(500).json({ error: 'internal error' });
-  }
+  return { success: true };
 });
 
-// ===== Boot =====
-(async () => {
-  try {
-    await initAsync();
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`[boot] listening on ${PORT}`);
-    });
-  } catch (e) {
-    console.error('[boot] fatal init error, exiting', e);
-    process.exit(1);
-  }
-})();
+// 削除 (deletePromise)
+exports.deletePromise = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const { promiseId } = data;
+
+  if (!promiseId) throw new functions.https.HttpsError('invalid-argument', 'promiseId required');
+
+  // ★必要であれば「ブロック中は削除禁止」などのチェックをここに追加可能
+  
+  await db.collection('users').doc(uid).collection('promises').doc(promiseId).delete();
+
+  return { success: true };
+});
+
+// ============================================================
+//  FCMトークン保存 (saveFcmToken)
+// ============================================================
+exports.saveFcmToken = functions.https.onCall(async (data, context) => {
+  const uid = getUid(context);
+  const { fcmToken } = data;
+
+  if (!fcmToken) return { success: false, message: 'no token' };
+
+  await db.collection('users').doc(uid).set(
+    {
+      deviceStatus: {
+        fcmToken: fcmToken,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }
+    },
+    { merge: true }
+  );
+
+  return { success: true };
+});
