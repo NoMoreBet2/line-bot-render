@@ -444,19 +444,32 @@ exports.saveConsent = functions.https.onCall(async (data, context) => {
 // ============================================================
 //  5. ハートビート & Ping
 // ============================================================
+// ============================================================
+//  5. ハートビート & Ping
+// ============================================================
 exports.heartbeat = functions.https.onCall(async (data, context) => {
   const uid = getUid(context);
   const { isBlockActive, timingType } = data;
   const nowTs = admin.firestore.FieldValue.serverTimestamp();
   const userRef = db.collection('users').doc(uid);
 
+  // ★ この関数から書かれた印
+  const debugMarker = {
+    writer: "functions_heartbeat_v1",   // この関数名
+    writtenAtMs: Date.now(),            // 関数実行時のクライアント時間(ms)
+    timingType: timingType || "unknown" // クライアントから渡された種別
+  };
+
+  // users/{uid} ドキュメントの heartbeat フィールドを更新
   await userRef.set({
     heartbeat: {
       lastHeartbeat: nowTs,
-      reportedBlockStatus: isBlockActive === true
+      reportedBlockStatus: isBlockActive === true,
+      debug: debugMarker              // ★ ここで「この関数から」を刻印
     }
   }, { merge: true });
 
+  // heartbeat_logs 用のID生成
   const d = new Date();
   const docId = d.toLocaleString('ja-JP', { 
     timeZone: 'Asia/Tokyo',
@@ -464,14 +477,20 @@ exports.heartbeat = functions.https.onCall(async (data, context) => {
     hour: '2-digit', minute: '2-digit'
   }).replace(/[\/\s:]/g, '-');
 
+  // users/{uid}/heartbeat_logs/{docId} にログを追加
   await userRef.collection('heartbeat_logs').doc(docId).set({
     timestamp: nowTs,
     executedAt: Date.now(),
     timingType: timingType || 'unknown',
-    blockStatus: isBlockActive === true
+    blockStatus: isBlockActive === true,
+
+    // ★ ログ側にも同じ印を残しておく
+    writer: "functions_heartbeat_v1"
   });
+
   return { success: true };
 });
+
 
 exports.ackPing = functions.https.onCall(async (data, context) => {
   const uid = getUid(context);
